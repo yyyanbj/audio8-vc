@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Any
 
 from a8vc import __version__
 from a8vc.asr.sherpa import create_asr
@@ -19,6 +20,28 @@ from a8vc.voices.catalog import install_builtin_voices, list_builtin_voices
 from a8vc.voices.enroll import VoiceEnroller
 from a8vc.voices.format import verify_voice_pack
 from a8vc.voices.store import VoiceLibrary
+
+
+def _is_utf8_stream(stream: Any) -> bool:
+    enc = getattr(stream, "encoding", None) or ""
+    return enc.lower().replace("_", "-") in {"utf-8", "utf8"}
+
+
+def _configure_stdio() -> None:
+    """Avoid UnicodeEncodeError on legacy Windows console/pipe codepages (e.g. cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        if not _is_utf8_stream(stream):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+def _print_json(payload: Any) -> None:
+    """Emit valid JSON without UnicodeEncodeError or codepage mojibake on Windows pipes."""
+    print(json.dumps(payload, ensure_ascii=not _is_utf8_stream(sys.stdout), indent=2))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -214,7 +237,7 @@ def _cmd_voice(args: argparse.Namespace, cfg: AppConfig) -> int:
         installed_ids = {v["voice_id"] for v in lib.list_voices() if "error" not in v}
         catalog = list_builtin_voices(installed_ids=installed_ids)
         if args.as_json:
-            print(json.dumps(catalog, ensure_ascii=False, indent=2))
+            _print_json(catalog)
             return 0
         if not catalog:
             print("No bundled built-in voices found.")
@@ -225,7 +248,7 @@ def _cmd_voice(args: argparse.Namespace, cfg: AppConfig) -> int:
             print(
                 f"- {item['voice_id']:<22} [{item['category_label']}] {item['name']}  "
                 f"lang={item['language']}  dur={item['duration_sec']}s  size={kb:.1f}KB  "
-                f"({item['license']}, {mark}) — {item['source_project']}"
+                f"({item['license']}, {mark}) - {item['source_project']}"
             )
         return 0
 
@@ -245,12 +268,12 @@ def _cmd_voice(args: argparse.Namespace, cfg: AppConfig) -> int:
 
     if args.voice_cmd == "inspect":
         pack = lib.load(args.target, verify_checksum=True)
-        print(json.dumps(pack.manifest.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        _print_json(pack.manifest.model_dump(mode="json"))
         return 0
 
     if args.voice_cmd == "verify":
         report = verify_voice_pack(args.path)
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        _print_json(report)
         return 0
 
     if args.voice_cmd == "pack":
@@ -432,7 +455,7 @@ def _cmd_live(args: argparse.Namespace, cfg: AppConfig) -> int:
                     print(f"  - {item['voice_id']} ({item.get('name', '')})")
                 continue
             if cmd == "stats":
-                print(json.dumps(engine.stats(), ensure_ascii=False, indent=2))
+                _print_json(engine.stats())
                 continue
             if cmd:
                 try:
@@ -505,7 +528,7 @@ def _cmd_download(args: argparse.Namespace, cfg: AppConfig) -> int:
     want_asr = bool(args.asr_sensevoice or args.download_all)
     want_vad = bool(args.silero_vad or args.download_all)
     if not any([want_audio8, want_asr, want_vad]):
-        print(json.dumps(inspect_models(cfg), ensure_ascii=False, indent=2))
+        _print_json(inspect_models(cfg))
         print("\nTip: run `a8vc download --all` (add `--mirror` in mainland China) to download models.")
         return 0
 
@@ -527,7 +550,7 @@ def _cmd_download(args: argparse.Namespace, cfg: AppConfig) -> int:
         download_silero_vad(Path(cfg.paths.vad_model_path))
 
     print("Download complete! Model status:")
-    print(json.dumps(inspect_models(cfg), ensure_ascii=False, indent=2))
+    _print_json(inspect_models(cfg))
     return 0
 
 
@@ -554,7 +577,7 @@ def _cmd_info(args: argparse.Namespace, cfg: AppConfig) -> int:
         "models": models,
     }
     if args.as_json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        _print_json(payload)
         return 0
 
     print(f"Audio8-VC v{payload['version']} ({payload['platform_release']})")
@@ -571,6 +594,7 @@ def _cmd_info(args: argparse.Namespace, cfg: AppConfig) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "desktop":

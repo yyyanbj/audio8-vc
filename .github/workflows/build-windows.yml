@@ -133,11 +133,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe voice list failed with code $LASTEXITCODE"
           }
+          & $cli voice builtins
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed a8vc.exe voice builtins failed with code $LASTEXITCODE"
+          }
           $builtinsRaw = & $cli voice builtins --json
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe voice builtins --json failed with code $LASTEXITCODE"
           }
-          $builtins = ($builtinsRaw -join "`n") | ConvertFrom-Json
+          $builtins = @(($builtinsRaw -join "`n") | ConvertFrom-Json)
           if ($builtins.Count -lt 15) {
             throw "Expected at least 15 bundled built-in voices in installed build, got $($builtins.Count)"
           }

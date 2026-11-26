@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -228,6 +231,37 @@ def test_cli_builtin_voice_commands(tmp_path: Path, capsys: object) -> None:
     table = capsys.readouterr().out  # type: ignore[attr-defined]
     assert "voxcpm_tsundere" in table
     assert "kokoro_heart_en" in table
+
+
+def test_cli_builtins_safe_under_windows_cp1252_stdio(tmp_path: Path) -> None:
+    """Ensure CJK built-in voice names never trigger UnicodeEncodeError on cp1252 Windows pipes."""
+    voices_dir = tmp_path / "cp1252_voices"
+    cfg_path = tmp_path / "cp1252.toml"
+    cfg_path.write_text(f'[paths]\nvoices_dir = "{voices_dir.as_posix()}"\n', encoding="utf-8")
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "cp1252"
+    env.pop("PYTHONUTF8", None)
+
+    res_json = subprocess.run(
+        [sys.executable, "-m", "a8vc.cli", "--config", str(cfg_path), "voice", "builtins", "--json"],
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert res_json.returncode == 0, res_json.stderr.decode("cp1252", errors="replace")
+    parsed = json.loads(res_json.stdout.decode("ascii"))
+    assert len(parsed) == 15
+    assert parsed[0]["name"] == "傲娇少女 · 冰淇淋"
+
+    res_table = subprocess.run(
+        [sys.executable, "-m", "a8vc.cli", "--config", str(cfg_path), "voice", "builtins"],
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert res_table.returncode == 0, res_table.stderr.decode("cp1252", errors="replace")
+    assert b"voxcpm_tsundere" in res_table.stdout
 
 
 def test_packaging_and_ui_include_builtin_voices() -> None:
