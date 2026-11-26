@@ -47,6 +47,11 @@ from a8vc.paths import (
 )
 from a8vc.runtime.audio8_onnx import Audio8OnnxRuntime, SynthesizerBackend
 from a8vc.runtime.providers import probe_provider_info
+from a8vc.voices.catalog import (
+    ensure_builtins_seeded,
+    install_builtin_voices,
+    list_builtin_voices,
+)
 from a8vc.voices.enroll import VoiceEnroller
 from a8vc.voices.store import VoiceLibrary
 
@@ -88,6 +93,11 @@ class OpenDirRequest(BaseModel):
     target: str = Field(default="data", pattern="^(data|voices|models|logs)$")
 
 
+class InstallBuiltinsRequest(BaseModel):
+    voice_ids: list[str] | None = None
+    overwrite: bool = False
+
+
 def _open_directory_in_os(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
@@ -114,7 +124,11 @@ class ServerState:
     ) -> None:
         self.cfg = cfg
         self.desktop_mode = desktop_mode
-        self.library = library or VoiceLibrary(cfg.paths.voices_dir)
+        if library is not None:
+            self.library = library
+        else:
+            self.library = VoiceLibrary(cfg.paths.voices_dir)
+            ensure_builtins_seeded(self.library)
         self._synthesizer = synthesizer
         self._asr = asr
         self.enroller = enroller or VoiceEnroller(
@@ -418,6 +432,41 @@ def create_app(
     async def list_voices() -> dict[str, Any]:
         return {
             "active_voice_id": srv_state.active_voice_id,
+            "voices": srv_state.library.list_voices(),
+        }
+
+    @app.get("/api/voices/builtins")
+    async def list_builtin_voice_catalog() -> dict[str, Any]:
+        installed_ids = {
+            v["voice_id"]
+            for v in srv_state.library.list_voices()
+            if "error" not in v
+        }
+        return {
+            "builtins": list_builtin_voices(installed_ids=installed_ids),
+        }
+
+    @app.post("/api/voices/builtins/install")
+    async def install_builtins(req: InstallBuiltinsRequest) -> dict[str, Any]:
+        try:
+            res = await asyncio.to_thread(
+                install_builtin_voices,
+                srv_state.library,
+                voice_ids=req.voice_ids,
+                overwrite=req.overwrite,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        installed_ids = {
+            v["voice_id"]
+            for v in srv_state.library.list_voices()
+            if "error" not in v
+        }
+        return {
+            **res,
+            "builtins": list_builtin_voices(installed_ids=installed_ids),
             "voices": srv_state.library.list_voices(),
         }
 

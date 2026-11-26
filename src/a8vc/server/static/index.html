@@ -143,7 +143,7 @@
       background: linear-gradient(90deg, #4f8cff, #2ecc71);
       transition: width 0.25s ease;
     }
-    .voice-list { display: grid; gap: 8px; max-height: 250px; overflow-y: auto; }
+    .voice-list { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; }
     .voice-item {
       display: flex;
       justify-content: space-between;
@@ -163,6 +163,30 @@
       font-size: 12px;
       padding: 4px 6px;
     }
+    .tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .tag {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 11px;
+      background: #1f2738;
+      color: #a8b8d8;
+    }
+    .tag.cat { background: rgba(79, 140, 255, 0.16); color: #8cb6ff; }
+    .tag.lic { background: rgba(46, 204, 113, 0.14); color: #6ce09a; }
+    .filter-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .filter-btn {
+      width: auto;
+      margin: 0;
+      padding: 4px 10px;
+      font-size: 12px;
+      background: #1a2130;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-weight: 500;
+    }
+    .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
     .metrics-box {
       margin-top: 10px;
       padding: 8px 10px;
@@ -305,13 +329,37 @@
       <!-- Voice Library -->
       <div class="card">
         <div class="card-head">
-          <h2>3. 已安装音色库 (.a8voice)</h2>
-          <button class="secondary small" id="btn-refresh-voices">刷新</button>
+          <h2>3. 音色库与内置开源预设 (.a8voice)</h2>
+          <div style="display:flex; gap:6px;">
+            <button class="secondary small" id="btn-install-all-builtins" title="恢复或导入全部内置开源精选音色">恢复内置音色</button>
+            <button class="secondary small" id="btn-refresh-voices">刷新</button>
+          </div>
         </div>
-        <div id="voice-list" class="voice-list"></div>
-        <label for="import-file" style="margin-top:12px;">导入现有 .a8voice 音色文件（Windows 安装版也可直接双击 .a8voice 导入）</label>
-        <input type="file" id="import-file" accept=".a8voice" />
-        <button id="btn-import" class="secondary">上传导入 .a8voice</button>
+        <div class="tabs">
+          <button class="tab-btn active" id="tab-voices-installed" type="button">已安装音色</button>
+          <button class="tab-btn" id="tab-voices-builtins" type="button">内置开源音色库</button>
+        </div>
+
+        <div class="tab-panel active" id="panel-voices-installed">
+          <div id="voice-list" class="voice-list"></div>
+          <label for="import-file" style="margin-top:12px;">导入现有 .a8voice 音色文件（Windows 安装版也可直接双击 .a8voice 导入）</label>
+          <input type="file" id="import-file" accept=".a8voice" />
+          <button id="btn-import" class="secondary">上传导入 .a8voice</button>
+        </div>
+
+        <div class="tab-panel" id="panel-voices-builtins">
+          <div class="filter-bar" id="builtin-filter-bar">
+            <button type="button" class="filter-btn active" data-cat="all">全部</button>
+            <button type="button" class="filter-btn" data-cat="anime">二次元</button>
+            <button type="button" class="filter-btn" data-cat="game">游戏角色</button>
+            <button type="button" class="filter-btn" data-cat="zh">中文精选</button>
+            <button type="button" class="filter-btn" data-cat="en">英文精选</button>
+          </div>
+          <div id="builtin-voice-list" class="voice-list"></div>
+          <p class="sub" style="margin-top:8px;">
+            全部内置音色均取材自高热度合规开源项目（VoxCPM / CosyVoice / Kokoro-82M / Kyutai / Qwen3-TTS / Edge0），离线内置即用。
+          </p>
+        </div>
       </div>
 
       <!-- Voice Enrollment -->
@@ -365,6 +413,7 @@
     const logEl = document.getElementById("log");
     const voiceSelect = document.getElementById("vc-voice");
     const voiceListEl = document.getElementById("voice-list");
+    const builtinVoiceListEl = document.getElementById("builtin-voice-list");
     const localInSelect = document.getElementById("local-in-dev");
     const localOutSelect = document.getElementById("local-out-dev");
     const localMetricsEl = document.getElementById("local-metrics");
@@ -387,6 +436,8 @@
     let devicesAvailable = true;
     let lastEventTs = 0;
     let dlPollTimer = null;
+    let builtinCatalog = [];
+    let builtinCategoryFilter = "all";
 
     function log(msg) {
       const ts = new Date().toLocaleTimeString();
@@ -404,6 +455,25 @@
     }
     document.getElementById("tab-local").onclick = () => setTab("local");
     document.getElementById("tab-web").onclick = () => setTab("web");
+
+    function setVoiceTab(mode) {
+      document.getElementById("tab-voices-installed").classList.toggle("active", mode === "installed");
+      document.getElementById("tab-voices-builtins").classList.toggle("active", mode === "builtins");
+      document.getElementById("panel-voices-installed").classList.toggle("active", mode === "installed");
+      document.getElementById("panel-voices-builtins").classList.toggle("active", mode === "builtins");
+    }
+    document.getElementById("tab-voices-installed").onclick = () => setVoiceTab("installed");
+    document.getElementById("tab-voices-builtins").onclick = () => setVoiceTab("builtins");
+
+    document.getElementById("builtin-filter-bar").addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".filter-btn");
+      if (!btn) return;
+      builtinCategoryFilter = btn.dataset.cat || "all";
+      for (const b of document.querySelectorAll("#builtin-filter-bar .filter-btn")) {
+        b.classList.toggle("active", b === btn);
+      }
+      renderBuiltinVoices();
+    });
 
     async function openOsDir(target) {
       try {
@@ -625,24 +695,124 @@
     }
     document.getElementById("btn-refresh-devices").onclick = refreshDevices;
 
+    async function installBuiltins(voiceIds = null, overwrite = false) {
+      try {
+        const res = await fetch("/api/voices/builtins/install", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice_ids: voiceIds, overwrite })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          log("导入内置音色失败: " + (data.detail || res.status));
+          return;
+        }
+        const n = (data.installed || []).length;
+        const skipped = (data.skipped || []).length;
+        log(`内置音色导入完成：新增 ${n} 个，已存在跳过 ${skipped} 个。`);
+        await refreshVoices();
+      } catch (e) {
+        log("导入内置音色异常: " + e);
+      }
+    }
+
+    function renderBuiltinVoices() {
+      builtinVoiceListEl.innerHTML = "";
+      const filtered = builtinCategoryFilter === "all"
+        ? builtinCatalog
+        : builtinCatalog.filter(b => b.category === builtinCategoryFilter);
+      if (!filtered.length) {
+        const empty = document.createElement("p");
+        empty.className = "sub";
+        empty.textContent = "该分类暂无内置音色。";
+        builtinVoiceListEl.appendChild(empty);
+        return;
+      }
+      for (const b of filtered) {
+        const row = document.createElement("div");
+        row.className = "voice-item";
+
+        const info = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = b.name;
+        const vidSpan = document.createElement("span");
+        vidSpan.className = "sub";
+        vidSpan.textContent = ` (${b.voice_id})`;
+        const desc = document.createElement("div");
+        desc.className = "sub";
+        desc.textContent = b.description || "";
+        const tags = document.createElement("div");
+        tags.className = "tag-row";
+        const catTag = document.createElement("span");
+        catTag.className = "tag cat";
+        catTag.textContent = `${b.category_label || b.category} · ${b.language}`;
+        const srcTag = document.createElement("span");
+        srcTag.className = "tag";
+        srcTag.textContent = b.source_rank_note ? `${b.source_project} (${b.source_rank_note})` : b.source_project;
+        const licTag = document.createElement("span");
+        licTag.className = "tag lic";
+        licTag.textContent = b.license || "Open Source";
+        tags.appendChild(catTag);
+        tags.appendChild(srcTag);
+        tags.appendChild(licTag);
+
+        info.appendChild(title);
+        info.appendChild(vidSpan);
+        info.appendChild(desc);
+        info.appendChild(tags);
+
+        const actions = document.createElement("div");
+        actions.className = "voice-actions";
+        if (b.installed) {
+          const useBtn = document.createElement("button");
+          useBtn.textContent = "已安装 · 选用";
+          useBtn.className = "secondary small";
+          useBtn.onclick = () => {
+            voiceSelect.value = b.voice_id;
+            voiceSelect.dispatchEvent(new Event("change"));
+            log(`已选中音色: ${b.name} (${b.voice_id})`);
+          };
+          actions.appendChild(useBtn);
+        } else {
+          const instBtn = document.createElement("button");
+          instBtn.textContent = "安装";
+          instBtn.className = "small";
+          instBtn.onclick = () => installBuiltins([b.voice_id], false);
+          actions.appendChild(instBtn);
+        }
+
+        row.appendChild(info);
+        row.appendChild(actions);
+        builtinVoiceListEl.appendChild(row);
+      }
+    }
+
     async function refreshVoices() {
-      const res = await fetch("/api/voices");
+      const [res, bRes] = await Promise.all([fetch("/api/voices"), fetch("/api/voices/builtins")]);
       const data = await res.json();
+      const bData = bRes.ok ? await bRes.json() : { builtins: [] };
+      builtinCatalog = bData.builtins || [];
+      const builtinMap = new Map(builtinCatalog.map(b => [b.voice_id, b]));
+      document.getElementById("tab-voices-builtins").textContent = `内置开源音色库 (${builtinCatalog.length})`;
+      document.getElementById("tab-voices-installed").textContent = `已安装音色 (${data.voices.filter(v => !v.error).length})`;
+      renderBuiltinVoices();
+
       const prev = voiceSelect.value || data.active_voice_id || "";
       voiceSelect.innerHTML = "";
       voiceListEl.innerHTML = "";
       if (!data.voices.length) {
         const empty = document.createElement("p");
         empty.className = "sub";
-        empty.textContent = "暂无音色文件，请在右侧上传参考音频制作或导入 .a8voice。";
+        empty.textContent = "暂无已安装音色，可点击上方「恢复内置音色」或切换至「内置开源音色库」一键安装。";
         voiceListEl.appendChild(empty);
         return;
       }
       for (const v of data.voices) {
         if (v.error) continue;
+        const metaBuiltin = builtinMap.get(v.voice_id);
         const opt = document.createElement("option");
         opt.value = v.voice_id;
-        opt.textContent = `${v.name} (${v.voice_id}, ${v.duration_sec}s, ${(v.size_bytes / 1024).toFixed(1)}KB)`;
+        opt.textContent = `${v.name} [${v.language}] (${v.voice_id}, ${v.duration_sec}s, ${(v.size_bytes / 1024).toFixed(1)}KB)`;
         if (v.voice_id === prev) opt.selected = true;
         voiceSelect.appendChild(opt);
 
@@ -657,10 +827,32 @@
         vidSpan.textContent = ` (${v.voice_id})`;
         const meta = document.createElement("div");
         meta.className = "sub";
-        meta.textContent = `${v.duration_sec}s · ${v.num_frames} frames · ${(v.size_bytes / 1024).toFixed(1)} KB`;
+        meta.textContent = `${v.language} · ${v.duration_sec}s · ${v.num_frames} frames · ${(v.size_bytes / 1024).toFixed(1)} KB`;
         info.appendChild(title);
         info.appendChild(vidSpan);
         info.appendChild(meta);
+        if (metaBuiltin || v.description) {
+          const tags = document.createElement("div");
+          tags.className = "tag-row";
+          if (metaBuiltin) {
+            const ct = document.createElement("span");
+            ct.className = "tag cat";
+            ct.textContent = metaBuiltin.category_label;
+            const st = document.createElement("span");
+            st.className = "tag";
+            st.textContent = metaBuiltin.source_project;
+            tags.appendChild(ct);
+            tags.appendChild(st);
+          } else if (Array.isArray(v.tags)) {
+            for (const tg of v.tags.slice(0, 3)) {
+              const s = document.createElement("span");
+              s.className = "tag";
+              s.textContent = tg;
+              tags.appendChild(s);
+            }
+          }
+          info.appendChild(tags);
+        }
 
         const actions = document.createElement("div");
         actions.className = "voice-actions";
@@ -692,6 +884,7 @@
       }
     }
     document.getElementById("btn-refresh-voices").onclick = refreshVoices;
+    document.getElementById("btn-install-all-builtins").onclick = () => installBuiltins(null, false);
 
     // Local live voice conversion control
     async function pollLocalStatus() {

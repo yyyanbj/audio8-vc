@@ -133,6 +133,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe voice list failed with code $LASTEXITCODE"
           }
+          $builtinsRaw = & $cli voice builtins --json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed a8vc.exe voice builtins --json failed with code $LASTEXITCODE"
+          }
+          $builtins = ($builtinsRaw -join "`n") | ConvertFrom-Json
+          if ($builtins.Count -lt 15) {
+            throw "Expected at least 15 bundled built-in voices in installed build, got $($builtins.Count)"
+          }
+          Write-Host "Verified $($builtins.Count) bundled built-in voices in installed build."
           & $cli devices
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "a8vc.exe devices returned $LASTEXITCODE (expected on headless runner without audio endpoints)"
@@ -182,6 +191,10 @@ jobs:
             release_staging/SHA256SUMS.txt
           generate_release_notes: true
           body: |
+            ### 内置 15 款开源音色预设（开箱即用）
+
+            安装包已内置 **15 款精选开源 `.a8voice` 音色**（涵盖二次元、游戏角色、中文精选、英文精选，总计仅 ~47 KB），首次启动自动初始化，也可在界面「内置开源音色库」页签按分类筛选或一键恢复。
+
             ### Windows 安装包版本选择指南
 
             - **DirectML GPU 通用版 (`*-win64-dml-setup.exe` / `-portable.zip`) — 推荐大多数 Windows 显卡用户**

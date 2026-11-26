@@ -124,6 +124,17 @@ def get_static_dir() -> Path:
     return pkg_static
 
 
+def get_builtin_voices_dir() -> Path:
+    """Locate bundled read-only built-in `.a8voice` preset directory across source and frozen builds."""
+    pkg_builtins = Path(__file__).resolve().parent / "voices" / "builtins"
+    if pkg_builtins.is_dir():
+        return pkg_builtins
+    bundle_builtins = get_bundle_dir() / "a8vc" / "voices" / "builtins"
+    if bundle_builtins.is_dir():
+        return bundle_builtins
+    return pkg_builtins
+
+
 def get_icon_path(ext: str = "ico") -> Path | None:
     """Locate bundled application icon (`.ico` or `.png`)."""
     filename = f"audio8_vc.{ext.lstrip('.')}"

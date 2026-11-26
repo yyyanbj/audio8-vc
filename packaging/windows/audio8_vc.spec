@@ -22,6 +22,7 @@ VERSION_FILE = SPEC_DIR / "version_info.txt"
 datas: list[tuple[str, str]] = [
     (str(REPO_ROOT / "configs" / "default.toml"), "configs"),
     (str(SRC_DIR / "a8vc" / "server" / "static"), "a8vc/server/static"),
+    (str(SRC_DIR / "a8vc" / "voices" / "builtins"), "a8vc/voices/builtins"),
     (str(SPEC_DIR / "assets" / "audio8_vc.ico"), "assets"),
     (str(SPEC_DIR / "assets" / "audio8_vc.png"), "assets"),
     (str(REPO_ROOT / "README.md"), "."),

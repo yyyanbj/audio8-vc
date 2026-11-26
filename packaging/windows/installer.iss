@@ -1,9 +1,9 @@
 ; Inno Setup 6 installer script for Audio8-VC (Windows x64)
 ; Build via:
-;   ISCC.exe /DAppVersion=0.1.0 /DSourceDir=..\..\dist\Audio8-VC /DOutputDir=..\..\dist\release /DVariant=cpu installer.iss
+;   ISCC.exe /DAppVersion=0.2.0 /DSourceDir=..\..\dist\Audio8-VC /DOutputDir=..\..\dist\release /DVariant=cpu installer.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\..\dist\Audio8-VC"

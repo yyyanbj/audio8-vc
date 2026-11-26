@@ -15,6 +15,7 @@ from a8vc.config import AppConfig, load_config
 from a8vc.engine.base import VCOutputEvent
 from a8vc.engine.cascaded import CascadedVCEngine, RealtimeVCWorker, get_process_rss_mb
 from a8vc.runtime.audio8_onnx import Audio8OnnxRuntime
+from a8vc.voices.catalog import install_builtin_voices, list_builtin_voices
 from a8vc.voices.enroll import VoiceEnroller
 from a8vc.voices.format import verify_voice_pack
 from a8vc.voices.store import VoiceLibrary
@@ -72,6 +73,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     exp_p.add_argument("voice_id", help="Voice ID to export")
     exp_p.add_argument("output_dir", help="Parent directory for official voice folder")
+
+    builtins_p = voice_sub.add_parser(
+        "builtins", help="List curated built-in open-source .a8voice presets"
+    )
+    builtins_p.add_argument("--json", action="store_true", dest="as_json", help="Output JSON")
+
+    inst_b_p = voice_sub.add_parser(
+        "install-builtins", help="Install bundled open-source built-in .a8voice presets into voices_dir"
+    )
+    inst_b_p.add_argument(
+        "--id",
+        action="append",
+        dest="voice_ids",
+        default=[],
+        help="Specific built-in voice_id to install (repeatable; omit to install all)",
+    )
+    inst_b_p.add_argument("--overwrite", action="store_true", help="Overwrite existing installed voices")
 
     # --- devices ---
     sub.add_parser("devices", help="List available local audio input/output devices")
@@ -179,6 +197,7 @@ def _cmd_voice(args: argparse.Namespace, cfg: AppConfig) -> int:
         voices = lib.list_voices()
         if not voices:
             print(f"No .a8voice packs found in {lib.root}")
+            print("Tip: run `a8vc voice install-builtins` to install bundled open-source preset voices.")
             return 0
         for item in voices:
             if "error" in item:
@@ -189,6 +208,39 @@ def _cmd_voice(args: argparse.Namespace, cfg: AppConfig) -> int:
                     f"- {item['voice_id']:<20} name={item['name']}  lang={item['language']}  "
                     f"dur={item['duration_sec']}s  frames={item['num_frames']}  size={kb:.1f}KB"
                 )
+        return 0
+
+    if args.voice_cmd == "builtins":
+        installed_ids = {v["voice_id"] for v in lib.list_voices() if "error" not in v}
+        catalog = list_builtin_voices(installed_ids=installed_ids)
+        if args.as_json:
+            print(json.dumps(catalog, ensure_ascii=False, indent=2))
+            return 0
+        if not catalog:
+            print("No bundled built-in voices found.")
+            return 0
+        for item in catalog:
+            mark = "installed" if item["installed"] else "available"
+            kb = item["size_bytes"] / 1024.0
+            print(
+                f"- {item['voice_id']:<22} [{item['category_label']}] {item['name']}  "
+                f"lang={item['language']}  dur={item['duration_sec']}s  size={kb:.1f}KB  "
+                f"({item['license']}, {mark}) — {item['source_project']}"
+            )
+        return 0
+
+    if args.voice_cmd == "install-builtins":
+        res = install_builtin_voices(
+            lib,
+            voice_ids=args.voice_ids or None,
+            overwrite=args.overwrite,
+        )
+        print(
+            f"Installed {len(res['installed'])} built-in voice(s) into {lib.root} "
+            f"(skipped {len(res['skipped'])} already present)."
+        )
+        for vid in res["installed"]:
+            print(f"  + {vid}")
         return 0
 
     if args.voice_cmd == "inspect":

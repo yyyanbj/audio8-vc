@@ -74,10 +74,19 @@ uv run python scripts/download_models.py --audio8-onnx
 uv run python scripts/download_models.py --audio8-onnx --asr-sensevoice --silero-vad
 ```
 
-### 3. 制作 / 管理 `.a8voice` 音色文件
+### 3. 开箱即用的内置开源音色 & 自定义 `.a8voice` 音色制作
+
+项目内置了 **15 款精选开源 `.a8voice` 音色包**（总体积仅约 **47 KB**，涵盖二次元角色、游戏角色、中文多风格与英文榜首音色，均源自 OpenBMB/VoxCPM、FunAudioLLM/CosyVoice、hexgrad/Kokoro-82M、kyutai/tts-voices、Qwen3-TTS ITA-Corpus 与 Edge0-AI/Audio8_TTS 等开源项目，详见 [`src/a8vc/voices/builtins/ATTRIBUTION.md`](src/a8vc/voices/builtins/ATTRIBUTION.md)）。
+
+- 首次启动 `a8vc serve` 或 Windows 桌面客户端（`Audio8-VC.exe`）时，内置音色会自动初始化到 `voices/` 目录；也可在 Web/桌面界面「内置开源音色库」页签按分类筛选、一键安装或恢复。
+- 命令行管理内置音色与自定义音色：
 
 ```bash
-# 从 3~15 秒人声参考音频一键打包生成 .a8voice 音色文件
+# 查看内置开源音色目录并安装到当前音色库
+uv run a8vc voice builtins
+uv run a8vc voice install-builtins
+
+# 从 3~15 秒人声参考音频一键打包生成自定义 .a8voice 音色文件
 uv run a8vc voice pack \
   --audio samples/target_speaker.wav \
   --id anime_girl \
@@ -93,8 +102,8 @@ uv run a8vc voice import-official /path/to/official/voices/default --id default
 
 # 查看 / 校验音色库
 uv run a8vc voice list
-uv run a8vc voice inspect anime_girl
-uv run a8vc voice verify voices/anime_girl.a8voice
+uv run a8vc voice inspect voxcpm_tsundere
+uv run a8vc voice verify voices/voxcpm_tsundere.a8voice
 ```
 
 ### 4. 启动实时变声
