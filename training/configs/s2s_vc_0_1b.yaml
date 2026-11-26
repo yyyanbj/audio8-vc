@@ -1,0 +1,39 @@
+# Track 2: Audio8-0.1B Native Codec-Space S2S Voice Conversion SFT Config Template
+model:
+  pretrained_model_name_or_path: "models/audio8-tts-preview-0.1b"
+  trust_remote_code: true
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+  # Set true to adapt only the acoustic Fast-AR head first, then unfreeze Slow-AR for joint tuning
+  freeze_slow_ar: false
+  freeze_fast_ar: false
+
+codec:
+  sample_rate: 44100
+  hop_length: 2048
+  num_codebooks: 10
+  codebook_size: 4096
+  semantic_begin_id: 65537
+
+data:
+  prepared_manifest: "training/data/vc_pairs_prepared.jsonl"
+  max_ref_seconds: 10.0
+  max_target_seconds: 15.0
+  # Self-reconstruction timbre perturbation for source semantic stream
+  perturbation:
+    pitch_shift_semitones: [-5.0, 5.0]
+    formant_shift_ratio: [0.85, 1.18]
+    random_eq_db: 4.0
+
+training:
+  output_dir: "training/checkpoints/audio8-vc-s2s-0.1b"
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.05
+  num_train_epochs: 3
+  slow_loss_weight: 0.5
+  fast_loss_weight: 1.5
+  save_steps: 500
+  logging_steps: 10
+  deepspeed_stage: 2

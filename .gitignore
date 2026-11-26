@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Model weights, voice libraries, and generated audio
+models/
+voices/*.a8voice
+outputs/
+*.wav
+*.flac
+*.mp3
+*.pcm
+*.onnx
+*.onnx.data
+*.pth
+*.safetensors
+
+# Training artifacts
+training/data/
+training/checkpoints/
+training/runs/
+wandb/
+
+# Local config overrides & OS files
+configs/local.toml
+.env
+.DS_Store
+Thumbs.db

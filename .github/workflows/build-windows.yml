@@ -1,0 +1,115 @@
+name: Build Windows Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "ONNX Runtime execution provider"
+        required: true
+        default: "cpu"
+        type: choice
+        options:
+          - cpu
+          - dml
+          - cuda
+      bundle_models:
+        description: "Bundle Audio8-0.1B + SenseVoice ASR + Silero VAD into offline installer (~500 MB)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64 Installer & Portable ZIP
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Run unit test suite
+        shell: pwsh
+        run: |
+          uv sync --extra dev
+          uv run pytest -v
+
+      - name: Build Audio8-VC Windows installer & portable ZIP
+        shell: pwsh
+        run: |
+          $provider = "${{ inputs.provider || 'cpu' }}"
+          $argsList = @("-Provider", $provider)
+          if ("${{ inputs.bundle_models }}" -eq "true") {
+            $argsList += "-BundleModels"
+          }
+          & .\packaging\windows\build_windows.ps1 @argsList
+
+      - name: Smoke-test generated Windows setup installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Path "dist\release" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $setup) {
+            throw "Expected Inno Setup installer (*-setup.exe) not found in dist\release"
+          }
+          $testDir = Join-Path $env:RUNNER_TEMP "Audio8-VC-InstallTest"
+          Write-Host "Silently installing $($setup.Name) into $testDir ..."
+          $proc = Start-Process -FilePath $setup.FullName -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/DIR=$testDir"
+          ) -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "Silent installer exited with code $($proc.ExitCode)"
+          }
+          if (-not (Test-Path (Join-Path $testDir "Audio8-VC.exe"))) {
+            throw "Installed Audio8-VC.exe missing under $testDir"
+          }
+          & (Join-Path $testDir "a8vc.exe") --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed a8vc.exe --version failed with code $LASTEXITCODE"
+          }
+          & (Join-Path $testDir "a8vc.exe") voice list
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed a8vc.exe voice list failed with code $LASTEXITCODE"
+          }
+          & (Join-Path $testDir "a8vc.exe") devices
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "a8vc.exe devices returned $LASTEXITCODE (expected on headless runner without audio endpoints)"
+            $global:LASTEXITCODE = 0
+          }
+          $uninstaller = Join-Path $testDir "unins000.exe"
+          if (Test-Path $uninstaller) {
+            Start-Process -FilePath $uninstaller -ArgumentList @("/VERYSILENT", "/NORESTART") -Wait
+          }
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audio8-VC-windows-x64-${{ inputs.provider || 'cpu' }}
+          path: dist/release/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (on version tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release/*
+          generate_release_notes: true

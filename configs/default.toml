@@ -1,0 +1,67 @@
+# Audio8 Real-Time Voice Changer 默认配置
+# 可复制为 configs/local.toml 或通过环境变量 A8VC_* / CLI 参数覆盖
+
+[paths]
+model_dir = "models/audio8-tts-0.1b-onnx-int8"
+voices_dir = "voices"
+asr_model_dir = "models/asr"
+vad_model_path = "models/vad/silero_vad.onnx"
+
+[runtime]
+# ONNX Execution Provider: "cpu" | "cuda" | "coreml" | "dml" | "auto"
+provider = "cpu"
+# CPU 线程数，0 表示自动使用物理核心的一半（避免抢占音频回调线程）
+threads = 0
+precision = "int8"
+codec_precision = "fp16"
+# 内存级 LRU 前缀状态缓存容量（每条约 10~12 MB，显著降低重复 prefill 延迟）
+prefix_cache_size = 2
+# 流式解码块大小（帧，21.53 fps；8 帧 ≈ 372ms，12 帧 ≈ 557ms）
+chunk_frames = 10
+# 滑窗解码上下文帧数（降低可减少 CPU 解码耗时，默认 128）
+stream_context_frames = 96
+stream_guard_frames = 1
+# 采样参数
+temperature = 0.7
+top_p = 0.9
+top_k = 50
+max_new_tokens = 512
+
+[audio]
+input_sample_rate = 16000
+output_sample_rate = 44100
+input_block_ms = 20
+input_device = ""
+output_device = ""
+# 相邻句段拼接淡入淡出时长（ms），消除爆音
+crossfade_ms = 12
+
+[vad]
+# "auto" (有 silero_vad.onnx 用 Silero，否则退回内置能量 VAD) | "energy" | "silero"
+backend = "auto"
+energy_threshold_db = -38.0
+speech_start_ms = 80
+min_silence_ms = 360
+pre_speech_ms = 160
+min_segment_ms = 250
+max_segment_ms = 4500
+
+[asr]
+# "sherpa" | "mock"
+backend = "sherpa"
+# "sense_voice" | "paraformer" | "zipformer"
+model_type = "sense_voice"
+language = "auto"
+num_threads = 2
+provider = "cpu"
+
+[engine]
+# "cascaded" (Track 1: 零训练即用) | "codec_s2s" (Track 2: 原生 Codec 空间实验/微调引擎)
+mode = "cascaded"
+# 积压超过该段数时丢弃最旧未合成句段，保证实时低延迟不雪崩
+max_pending_segments = 2
+
+[server]
+host = "127.0.0.1"
+port = 8025
+default_voice = ""

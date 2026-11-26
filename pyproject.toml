@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "audio8-vc"
+version = "0.1.0"
+description = "Low-footprint real-time voice changer built on Edge0-AI Audio8-TTS-0.1B with portable .a8voice packs"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "numpy>=1.24,<3",
+  "onnxruntime>=1.22,<1.24",
+  "tokenizers>=0.20,<0.23",
+  "soundfile>=0.12,<1",
+  "scipy>=1.10,<2",
+  "fastapi>=0.110,<1",
+  "uvicorn[standard]>=0.29,<1",
+  "pydantic>=2.6,<3",
+  "python-multipart>=0.0.9,<1",
+  "tomli>=2.0.1,<3; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+audio = [
+  "sounddevice>=0.4.6,<1",
+]
+asr = [
+  "sherpa-onnx>=1.10,<2",
+]
+download = [
+  "huggingface_hub>=0.24,<1",
+]
+desktop = [
+  "pywebview>=5.1,<7",
+]
+build = [
+  "pyinstaller>=6.10,<7",
+]
+train = [
+  "torch>=2.5",
+  "transformers>=4.57.0,<5",
+  "datasets>=3.0",
+  "accelerate>=1.0",
+  "deepspeed>=0.15",
+  "pyyaml>=6.0",
+]
+all = [
+  "audio8-vc[audio,asr,download]",
+]
+windows = [
+  "audio8-vc[audio,asr,download,desktop]",
+]
+dev = [
+  "pytest>=8.0",
+  "httpx>=0.27",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+a8vc = "a8vc.cli:main"
+
+[project.gui-scripts]
+a8vc-desktop = "a8vc.desktop:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/a8vc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
