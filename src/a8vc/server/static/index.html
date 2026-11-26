@@ -201,6 +201,7 @@
         <p class="sub">Edge0-AI Audio8-TTS-0.1B (ONNX INT8) · 独立 <code>.a8voice</code> 音色包 · 低内存前缀缓存</p>
         <div class="pill-bar">
           <span class="pill" id="pill-status">检测服务中...</span>
+          <span class="pill" id="pill-provider">加速后端: --</span>
           <span class="pill" id="pill-rss">RSS: -- MB</span>
           <span class="pill" id="pill-cache">前缀缓存: --</span>
           <span class="pill" id="pill-mode">模式: --</span>
@@ -432,6 +433,24 @@
       }
     }
 
+    let lastProviderWarning = null;
+
+    function formatProviderLabel(epOrName) {
+      if (!epOrName) return "CPU";
+      const map = {
+        CUDAExecutionProvider: "GPU (CUDA)",
+        DmlExecutionProvider: "GPU (DirectML)",
+        CoreMLExecutionProvider: "GPU (CoreML)",
+        CPUExecutionProvider: "CPU",
+        cuda: "GPU (CUDA)",
+        dml: "GPU (DirectML)",
+        coreml: "GPU (CoreML)",
+        cpu: "CPU",
+        auto: "自动"
+      };
+      return map[epOrName] || epOrName;
+    }
+
     async function refreshHealth() {
       try {
         const [hRes, sysRes] = await Promise.all([fetch("/api/health"), fetch("/api/system/info")]);
@@ -440,6 +459,25 @@
         const pill = document.getElementById("pill-status");
         pill.textContent = `状态: ${data.status} (v${data.version})`;
         pill.className = "pill ok";
+
+        const provPill = document.getElementById("pill-provider");
+        const activeEp = data.active_provider || (sys.resolved_providers && sys.resolved_providers[0]) || sys.provider;
+        const provWarn = data.provider_warning || sys.provider_warning || null;
+        if (provWarn) {
+          provPill.textContent = `后端: ${formatProviderLabel(activeEp)} (已回退)`;
+          provPill.className = "pill warn";
+          provPill.title = provWarn;
+          if (lastProviderWarning !== provWarn) {
+            lastProviderWarning = provWarn;
+            log("加速后端提示: " + provWarn);
+          }
+        } else {
+          const isGpu = activeEp && activeEp !== "CPUExecutionProvider" && activeEp !== "cpu";
+          provPill.textContent = `后端: ${formatProviderLabel(activeEp)}`;
+          provPill.className = isGpu ? "pill ok" : "pill";
+          provPill.title = `配置=${sys.provider}, ORT=${sys.ort_flavor || "unknown"} (${(sys.available_providers || []).join(", ")})`;
+        }
+
         document.getElementById("pill-rss").textContent = `RSS: ${data.rss_mb} MB`;
         document.getElementById("pill-mode").textContent =
           sys.is_portable ? "便携模式 (./data)" : (sys.desktop_mode ? "桌面模式" : "服务模式");

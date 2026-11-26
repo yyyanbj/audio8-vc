@@ -16,6 +16,7 @@ from a8vc.config import RuntimeConfig
 from a8vc.runtime.manifest import RuntimeManifest, load_runtime_manifest
 from a8vc.runtime.prefix_cache import PrefixStateCache, PrefixStateSnapshot
 from a8vc.runtime.prompt import PromptBuilder
+from a8vc.runtime.providers import create_onnx_session, resolve_providers
 from a8vc.runtime.sampling import sample_codebook, sample_semantic
 from a8vc.voices.format import VoicePack
 
@@ -93,22 +94,7 @@ def _ort_type_to_numpy(type_str: str) -> np.dtype[Any]:
 
 
 def _resolve_providers(provider: str) -> list[str]:
-    import onnxruntime as ort
-
-    available = set(ort.get_available_providers())
-    if provider == "cpu":
-        return ["CPUExecutionProvider"]
-    if provider == "cuda":
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in available else ["CPUExecutionProvider"]
-    if provider == "coreml":
-        return ["CoreMLExecutionProvider", "CPUExecutionProvider"] if "CoreMLExecutionProvider" in available else ["CPUExecutionProvider"]
-    if provider == "dml":
-        return ["DmlExecutionProvider", "CPUExecutionProvider"] if "DmlExecutionProvider" in available else ["CPUExecutionProvider"]
-    # "auto"
-    for ep in ("CUDAExecutionProvider", "CoreMLExecutionProvider", "DmlExecutionProvider"):
-        if ep in available:
-            return [ep, "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
+    return resolve_providers(provider)
 
 
 class Audio8OnnxRuntime:
@@ -119,7 +105,6 @@ class Audio8OnnxRuntime:
         model_dir: str | Path,
         cfg: RuntimeConfig | None = None,
     ) -> None:
-        import onnxruntime as ort
         from tokenizers import Tokenizer
 
         self.cfg = cfg or RuntimeConfig()
@@ -147,16 +132,30 @@ class Audio8OnnxRuntime:
             threads = max(1, min(8, cpu_count // 2))
         self.threads = threads
 
-        opts = ort.SessionOptions()
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.intra_op_num_threads = threads
-        opts.inter_op_num_threads = max(1, threads // 2)
-        opts.log_severity_level = 3
-
-        providers = _resolve_providers(self.cfg.provider)
-        self._slow = ort.InferenceSession(str(self.manifest.slow_model_path), sess_options=opts, providers=providers)
-        self._fast = ort.InferenceSession(str(self.manifest.fast_model_path), sess_options=opts, providers=providers)
-        self._decoder = ort.InferenceSession(str(self.manifest.codec_decoder_path), sess_options=opts, providers=providers)
+        self._slow, slow_ep, slow_warn = create_onnx_session(
+            self.manifest.slow_model_path,
+            provider=self.cfg.provider,
+            threads=threads,
+        )
+        # If slow_ar already fell back to CPU, avoid redundant GPU error noise on fast/decoder
+        effective_req = "cpu" if (slow_warn is not None and slow_ep == "CPUExecutionProvider") else self.cfg.provider
+        self._fast, fast_ep, fast_warn = create_onnx_session(
+            self.manifest.fast_model_path,
+            provider=effective_req,
+            threads=threads,
+        )
+        self._decoder, dec_ep, dec_warn = create_onnx_session(
+            self.manifest.codec_decoder_path,
+            provider=effective_req,
+            threads=threads,
+        )
+        self.active_provider: str = slow_ep
+        self.session_providers: dict[str, str] = {
+            "slow_ar": slow_ep,
+            "fast_ar": fast_ep,
+            "codec_decoder": dec_ep,
+        }
+        self.provider_warning: str | None = slow_warn or fast_warn or dec_warn
         self._tokenizer = Tokenizer.from_file(str(self.manifest.tokenizer_path))
 
         self.prompt_builder = PromptBuilder(

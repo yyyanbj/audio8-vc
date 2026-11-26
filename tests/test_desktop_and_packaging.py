@@ -456,15 +456,22 @@ def test_windows_packaging_assets_and_spec_integrity(tmp_path: Path) -> None:
     assert 'name="Audio8-VC"' in spec_text
     assert 'name="a8vc"' in spec_text
 
-    # 3. Inno Setup installer script includes expected metadata and .a8voice association
+    # 3. Inno Setup installer script includes expected metadata, clean upgrade, and .a8voice association
     iss_text = (REPO_ROOT / "packaging" / "windows" / "installer.iss").read_text(encoding="utf-8")
     assert "Audio8-VC.exe" in iss_text
     assert "a8vc.exe" in iss_text
     assert ".a8voice" in iss_text
     assert "Audio8VC.VoicePack" in iss_text
     assert "IsValidWebView2Version" in iss_text
+    assert "[InstallDelete]" in iss_text
 
-    # 4. LocalLiveSessionManager rejects voice switch when not running
+    # 4. Workflow uses hashtable splatting (not array splatting) and builds CPU + GPU variants
+    wf_text = (REPO_ROOT / ".github" / "workflows" / "build-windows.yml").read_text(encoding="utf-8")
+    assert '@("-Provider"' not in wf_text
+    assert 'Provider = "${{ matrix.provider }}"' in wf_text
+    assert '["cpu","dml","cuda"]' in wf_text
+
+    # 5. LocalLiveSessionManager rejects voice switch when not running
     cfg = AppConfig()
     lib = _seed_voices(tmp_path / "voices_mgr")
     mgr = LocalLiveSessionManager(
@@ -474,3 +481,96 @@ def test_windows_packaging_assets_and_spec_integrity(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match="not running"):
         mgr.switch_voice("hero")
+
+
+def test_onnx_providers_directml_options_and_gpu_fallback(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from a8vc.runtime.providers import (
+        build_session_options,
+        create_onnx_session,
+        detect_ort_flavor,
+        probe_provider_info,
+        resolve_providers,
+    )
+
+    assert resolve_providers("cpu", ["CUDAExecutionProvider", "CPUExecutionProvider"]) == [
+        "CPUExecutionProvider"
+    ]
+    assert resolve_providers("dml", ["DmlExecutionProvider", "CPUExecutionProvider"]) == [
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert resolve_providers("cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"]) == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert resolve_providers("auto", ["DmlExecutionProvider", "CPUExecutionProvider"]) == [
+        "DmlExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert resolve_providers("cuda", ["CPUExecutionProvider"]) == ["CPUExecutionProvider"]
+
+    assert detect_ort_flavor(["CUDAExecutionProvider", "CPUExecutionProvider"]) == "cuda"
+    assert detect_ort_flavor(["DmlExecutionProvider", "CPUExecutionProvider"]) == "dml"
+    assert detect_ort_flavor(["CPUExecutionProvider"]) == "cpu"
+
+    class _FakeSessionOptions:
+        def __init__(self) -> None:
+            self.graph_optimization_level = None
+            self.intra_op_num_threads = 0
+            self.inter_op_num_threads = 0
+            self.log_severity_level = 0
+            self.enable_mem_pattern = True
+            self.execution_mode = "parallel"
+
+    class _FakeSession:
+        def __init__(self, providers: list[str]) -> None:
+            self._providers = providers
+
+        def get_providers(self) -> list[str]:
+            return list(self._providers)
+
+    attempts: list[list[str]] = []
+
+    def _failing_cuda_session(path: str, sess_options: Any, providers: list[str]) -> _FakeSession:
+        attempts.append(list(providers))
+        if "CUDAExecutionProvider" in providers:
+            raise RuntimeError("cublasLt64_12.dll not found")
+        return _FakeSession(providers)
+
+    fake_ort = SimpleNamespace(
+        SessionOptions=_FakeSessionOptions,
+        GraphOptimizationLevel=SimpleNamespace(ORT_ENABLE_ALL="all"),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL="sequential"),
+        get_available_providers=lambda: ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"],
+        InferenceSession=_failing_cuda_session,
+    )
+
+    # DirectML must disable memory pattern & use sequential execution
+    dml_opts = build_session_options(["DmlExecutionProvider", "CPUExecutionProvider"], threads=4, ort_module=fake_ort)
+    assert dml_opts.enable_mem_pattern is False
+    assert dml_opts.execution_mode == "sequential"
+
+    cpu_opts = build_session_options(["CPUExecutionProvider"], threads=4, ort_module=fake_ort)
+    assert cpu_opts.enable_mem_pattern is True
+
+    # Failed CUDA init cleanly falls back to CPU with a diagnostic warning
+    session, active_ep, warning = create_onnx_session(
+        tmp_path / "dummy.onnx",
+        provider="cuda",
+        threads=2,
+        ort_module=fake_ort,
+    )
+    assert isinstance(session, _FakeSession)
+    assert active_ep == "CPUExecutionProvider"
+    assert warning is not None and "CUDA 12" in warning
+    assert attempts == [
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        ["CPUExecutionProvider"],
+    ]
+
+    # Real ORT probe always returns structured diagnostics
+    info = probe_provider_info("cpu")
+    assert info["configured_provider"] == "cpu"
+    assert "CPUExecutionProvider" in info["available_providers"]

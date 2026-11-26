@@ -76,6 +76,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- devices ---
     sub.add_parser("devices", help="List available local audio input/output devices")
 
+    # --- info ---
+    info_p = sub.add_parser(
+        "info", help="Show runtime configuration, GPU/ONNX providers, paths, and model status"
+    )
+    info_p.add_argument("--json", action="store_true", dest="as_json", help="Output machine-readable JSON")
+
     # --- synth ---
     synth_p = sub.add_parser("synth", help="Synthesize a test WAV using a .a8voice pack")
     synth_p.add_argument("--voice", required=True, help="Voice ID or path to .a8voice")
@@ -473,6 +479,45 @@ def _cmd_download(args: argparse.Namespace, cfg: AppConfig) -> int:
     return 0
 
 
+def _cmd_info(args: argparse.Namespace, cfg: AppConfig) -> int:
+    import platform
+
+    from a8vc.models_manager import inspect_models
+    from a8vc.paths import get_data_dir, is_frozen, is_portable_mode
+    from a8vc.runtime.providers import probe_provider_info
+
+    provider_info = probe_provider_info(cfg.runtime.provider)
+    models = inspect_models(cfg)
+    payload = {
+        "version": __version__,
+        "platform": sys.platform,
+        "platform_release": platform.platform(),
+        "is_frozen": is_frozen(),
+        "is_portable": is_portable_mode(),
+        "data_dir": str(get_data_dir()),
+        "configured_provider": cfg.runtime.provider,
+        "asr_provider": cfg.asr.provider,
+        **provider_info,
+        "models_ready_for_vc": models["ready_for_vc"],
+        "models": models,
+    }
+    if args.as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Audio8-VC v{payload['version']} ({payload['platform_release']})")
+    print(f"  Frozen / Portable   : frozen={payload['is_frozen']} portable={payload['is_portable']}")
+    print(f"  Data dir            : {payload['data_dir']}")
+    print(f"  Configured provider : runtime={payload['configured_provider']} asr={payload['asr_provider']}")
+    print(f"  ORT version / flavor: {payload['ort_version']} ({payload['ort_flavor']})")
+    print(f"  Available providers : {', '.join(payload['available_providers']) or '(none)'}")
+    print(f"  Resolved providers  : {', '.join(payload['resolved_providers'])}")
+    if payload["cuda_dll_dirs"]:
+        print(f"  Detected CUDA dirs  : {', '.join(payload['cuda_dll_dirs'])}")
+    print(f"  Models ready for VC : {payload['models_ready_for_vc']}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -485,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_voice(args, cfg)
     if args.command == "devices":
         return _cmd_devices()
+    if args.command == "info":
+        return _cmd_info(args, cfg)
     if args.command == "synth":
         return _cmd_synth(args, cfg)
     if args.command == "benchmark":

@@ -38,3 +38,16 @@ def test_cli_voice_import_list_inspect_verify_export(
     assert main(["--config", str(cfg_path), "voice", "export-official", "demo", str(exported)]) == 0
     assert (exported / "demo" / "codes.npy").is_file()
     assert (exported / "demo" / "meta.json").is_file()
+
+
+def test_cli_info_json(tmp_path: Path, capsys: object) -> None:
+    cfg_path = tmp_path / "info.toml"
+    cfg_path.write_text('[runtime]\nprovider = "cpu"\n[asr]\nprovider = "cpu"\n', encoding="utf-8")
+
+    assert main(["--config", str(cfg_path), "info", "--json"]) == 0
+    out = capsys.readouterr().out  # type: ignore[attr-defined]
+    payload = json.loads(out)
+    assert payload["configured_provider"] == "cpu"
+    assert payload["asr_provider"] == "cpu"
+    assert "CPUExecutionProvider" in payload["available_providers"]
+    assert payload["ort_flavor"] in {"cpu", "dml", "cuda", "coreml"}

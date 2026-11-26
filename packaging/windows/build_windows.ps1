@@ -14,6 +14,11 @@
   If specified, downloads Audio8-0.1B ONNX INT8, SenseVoice ASR, and Silero VAD into the package
   for a fully offline all-in-one Windows distribution.
 
+.PARAMETER BundleCudaRuntime
+  When combined with -Provider cuda, also installs and bundles NVIDIA CUDA 12 / cuDNN 9 pip wheel
+  DLLs inside the build (~1.5 GB larger). Default is off (uses system CUDA 12 + cuDNN 9 or
+  drop-in `cuda_libs`).
+
 .PARAMETER UseMirror
   When combined with -BundleModels, downloads Hugging Face models via https://hf-mirror.com.
 
@@ -31,6 +36,7 @@ param(
     [ValidateSet("cpu", "dml", "cuda")]
     [string]$Provider = "cpu",
     [switch]$BundleModels,
+    [switch]$BundleCudaRuntime,
     [switch]$UseMirror,
     [switch]$SkipInstaller,
     [switch]$SkipPortableZip,
@@ -43,6 +49,17 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 Push-Location $RepoRoot
+
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string[]]$ArgsList = @()
+    )
+    & $Exe @ArgsList
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code ${LASTEXITCODE}: $Exe $($ArgsList -join ' ')"
+    }
+}
 
 try {
     Write-Host "=== Audio8-VC Windows Packaging Pipeline ===" -ForegroundColor Cyan
@@ -64,27 +81,45 @@ try {
     $hasUv = $null -ne (Get-Command uv -ErrorAction SilentlyContinue)
     if ($hasUv) {
         Write-Host "`n[1/6] Syncing dependencies with uv (--extra windows --extra build)..." -ForegroundColor Green
-        uv sync --extra windows --extra build
+        Invoke-Checked "uv" @("sync", "--extra", "windows", "--extra", "build")
+        $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
         if ($Provider -eq "dml") {
             Write-Host "Installing onnxruntime-directml for DirectML GPU acceleration..." -ForegroundColor Yellow
-            uv pip uninstall onnxruntime | Out-Null
-            uv pip install "onnxruntime-directml>=1.20,<1.24"
+            Invoke-Checked "uv" @("pip", "uninstall", "--python", $VenvPython, "onnxruntime")
+            Invoke-Checked "uv" @("pip", "install", "--python", $VenvPython, "onnxruntime-directml>=1.20,<1.24")
         } elseif ($Provider -eq "cuda") {
-            Write-Host "Installing onnxruntime-gpu for CUDA acceleration..." -ForegroundColor Yellow
-            uv pip uninstall onnxruntime | Out-Null
-            uv pip install "onnxruntime-gpu>=1.22,<1.24"
+            Write-Host "Installing onnxruntime-gpu for NVIDIA CUDA acceleration..." -ForegroundColor Yellow
+            Invoke-Checked "uv" @("pip", "uninstall", "--python", $VenvPython, "onnxruntime")
+            if ($BundleCudaRuntime) {
+                Write-Host "Installing optional NVIDIA CUDA 12 + cuDNN 9 runtime wheels..." -ForegroundColor Yellow
+                Invoke-Checked "uv" @(
+                    "pip", "install", "--python", $VenvPython,
+                    "onnxruntime-gpu[cuda,cudnn]>=1.22,<1.24",
+                    "nvidia-cublas-cu12<12.9.3"
+                )
+            } else {
+                Invoke-Checked "uv" @("pip", "install", "--python", $VenvPython, "onnxruntime-gpu>=1.22,<1.24")
+            }
         }
         $PyRun = @("uv", "run", "--no-sync")
     } else {
         Write-Host "`n[1/6] uv not found; using active python/pip environment..." -ForegroundColor Yellow
-        python -m pip install --upgrade pip
-        python -m pip install -e ".[windows,build]"
+        Invoke-Checked "python" @("-m", "pip", "install", "--upgrade", "pip")
+        Invoke-Checked "python" @("-m", "pip", "install", "-e", ".[windows,build]")
         if ($Provider -eq "dml") {
-            python -m pip uninstall -y onnxruntime
-            python -m pip install "onnxruntime-directml>=1.20,<1.24"
+            Invoke-Checked "python" @("-m", "pip", "uninstall", "-y", "onnxruntime")
+            Invoke-Checked "python" @("-m", "pip", "install", "onnxruntime-directml>=1.20,<1.24")
         } elseif ($Provider -eq "cuda") {
-            python -m pip uninstall -y onnxruntime
-            python -m pip install "onnxruntime-gpu>=1.22,<1.24"
+            Invoke-Checked "python" @("-m", "pip", "uninstall", "-y", "onnxruntime")
+            if ($BundleCudaRuntime) {
+                Invoke-Checked "python" @(
+                    "-m", "pip", "install",
+                    "onnxruntime-gpu[cuda,cudnn]>=1.22,<1.24",
+                    "nvidia-cublas-cu12<12.9.3"
+                )
+            } else {
+                Invoke-Checked "python" @("-m", "pip", "install", "onnxruntime-gpu>=1.22,<1.24")
+            }
         }
         $PyRun = @()
     }
@@ -92,12 +127,11 @@ try {
     function Invoke-Py {
         param([string[]]$ArgsList)
         if ($PyRun.Count -gt 0) {
-            & $PyRun[0] ($PyRun[1..($PyRun.Count - 1)] + $ArgsList)
+            $combined = @($PyRun[1..($PyRun.Count - 1)]) + $ArgsList
+            Invoke-Checked $PyRun[0] $combined
         } else {
-            & $ArgsList[0] $ArgsList[1..($ArgsList.Count - 1)]
-        }
-        if ($LASTEXITCODE -ne 0) {
-            throw "Command failed with exit code ${LASTEXITCODE}: $($ArgsList -join ' ')"
+            $subArgs = if ($ArgsList.Count -gt 1) { @($ArgsList[1..($ArgsList.Count - 1)]) } else { @() }
+            Invoke-Checked $ArgsList[0] $subArgs
         }
     }
 
@@ -112,12 +146,27 @@ try {
     if (Test-Path $DistAppDir) { Remove-Item -Recurse -Force $DistAppDir }
     New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 
-    Invoke-Py @(
-        "pyinstaller",
-        "--noconfirm",
-        "--clean",
-        "packaging\windows\audio8_vc.spec"
-    )
+    $prevBundleCuda = $env:A8VC_BUNDLE_CUDA_RUNTIME
+    try {
+        if ($Provider -eq "cuda" -and $BundleCudaRuntime) {
+            $env:A8VC_BUNDLE_CUDA_RUNTIME = "1"
+        } else {
+            Remove-Item Env:A8VC_BUNDLE_CUDA_RUNTIME -ErrorAction SilentlyContinue
+        }
+        Invoke-Py @(
+            "pyinstaller",
+            "--noconfirm",
+            "--clean",
+            "packaging\windows\audio8_vc.spec"
+        )
+    }
+    finally {
+        if ($null -ne $prevBundleCuda) {
+            $env:A8VC_BUNDLE_CUDA_RUNTIME = $prevBundleCuda
+        } else {
+            Remove-Item Env:A8VC_BUNDLE_CUDA_RUNTIME -ErrorAction SilentlyContinue
+        }
+    }
 
     if (-not (Test-Path (Join-Path $DistAppDir "Audio8-VC.exe"))) {
         throw "Build failed: Audio8-VC.exe was not generated."
@@ -126,7 +175,8 @@ try {
     # Helper to write UTF-8 without BOM (safe across PowerShell 5.1 & 7+ for Python tomllib)
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-    # Patch bundled default.toml when building a GPU provider flavor (dml / cuda)
+    # Patch ONLY [runtime].provider in bundled default.toml when building a GPU flavor (dml / cuda).
+    # Keep [asr].provider = "cpu" so sherpa-onnx remains compatible with standard CPU wheels.
     if ($Provider -ne "cpu") {
         $cfgCandidates = @(
             (Join-Path $DistAppDir "_internal\configs\default.toml"),
@@ -135,15 +185,33 @@ try {
         foreach ($cfgFile in $cfgCandidates) {
             if (Test-Path $cfgFile) {
                 $rawCfg = [System.IO.File]::ReadAllText($cfgFile, $Utf8NoBom)
-                $patchedCfg = $rawCfg -replace '(?m)^provider\s*=\s*"cpu"', "provider = `"$Provider`""
-                [System.IO.File]::WriteAllText($cfgFile, $patchedCfg, $Utf8NoBom)
-                Write-Host "Configured packaged default provider = '$Provider' in $cfgFile" -ForegroundColor Yellow
+                $lines = $rawCfg -split "`r?`n"
+                $section = ""
+                $replaced = $false
+                $patchedLines = for ($i = 0; $i -lt $lines.Count; $i++) {
+                    $line = $lines[$i]
+                    if ($line -match '^\s*\[([^\]]+)\]\s*$') {
+                        $section = $Matches[1].Trim()
+                    } elseif ($section -eq "runtime" -and $line -match '^\s*provider\s*=\s*"[^"]*"') {
+                        $line = "provider = `"$Provider`""
+                        $replaced = $true
+                    }
+                    $line
+                }
+                if (-not $replaced) {
+                    throw "Failed to locate [runtime] provider line in $cfgFile"
+                }
+                [System.IO.File]::WriteAllText($cfgFile, ($patchedLines -join "`n"), $Utf8NoBom)
+                Write-Host "Configured packaged [runtime] provider = '$Provider' in $cfgFile" -ForegroundColor Yellow
             }
         }
     }
 
     # 5. Optional: download & bundle models for offline all-in-one package
     $VariantTag = $Provider
+    if ($Provider -eq "cuda" -and $BundleCudaRuntime) {
+        $VariantTag = "cuda-standalone"
+    }
     if ($BundleModels) {
         Write-Host "`n[4/6] Downloading and bundling model weights into dist\Audio8-VC\models..." -ForegroundColor Green
         $dlArgs = @(
@@ -153,16 +221,34 @@ try {
         )
         if ($UseMirror) { $dlArgs += "--mirror" }
         Invoke-Py $dlArgs
-        $VariantTag = "${Provider}-full"
+        $VariantTag = "${VariantTag}-full"
     } else {
         Write-Host "`n[4/6] Skipping bundled model weights (online in-app download enabled)." -ForegroundColor DarkGray
     }
 
-    # Smoke-test built CLI executable
+    # Smoke-test built CLI executable and verify bundled execution provider flavor
     Write-Host "Running smoke test on built a8vc.exe..." -ForegroundColor Green
-    & (Join-Path $DistAppDir "a8vc.exe") --version
+    $BuiltCli = Join-Path $DistAppDir "a8vc.exe"
+    Invoke-Checked $BuiltCli @("--version")
+
+    $infoRaw = & $BuiltCli info --json
     if ($LASTEXITCODE -ne 0) {
-        throw "Smoke test failed: a8vc.exe --version returned exit code $LASTEXITCODE"
+        throw "Smoke test failed: a8vc.exe info --json returned exit code $LASTEXITCODE"
+    }
+    $info = ($infoRaw -join "`n") | ConvertFrom-Json
+    Write-Host "Built runtime info: provider=$($info.configured_provider), asr=$($info.asr_provider), ort_flavor=$($info.ort_flavor), available=[$($info.available_providers -join ', ')]" -ForegroundColor Cyan
+
+    if ($info.configured_provider -ne $Provider) {
+        throw "Expected configured_provider='$Provider', got '$($info.configured_provider)'"
+    }
+    if ($info.asr_provider -ne "cpu") {
+        throw "Expected asr_provider='cpu', got '$($info.asr_provider)'"
+    }
+    if ($Provider -eq "dml" -and ($info.available_providers -notcontains "DmlExecutionProvider")) {
+        throw "DirectML build is missing DmlExecutionProvider! Available: $($info.available_providers -join ', ')"
+    }
+    if ($Provider -eq "cuda" -and ($info.available_providers -notcontains "CUDAExecutionProvider")) {
+        throw "CUDA build is missing CUDAExecutionProvider! Available: $($info.available_providers -join ', ')"
     }
 
     $Artifacts = @()
@@ -212,15 +298,13 @@ try {
         }
 
         if ($null -ne $IsccPath) {
-            & $IsccPath `
-                "/DAppVersion=$Version" `
-                "/DSourceDir=$DistAppDir" `
-                "/DOutputDir=$ReleaseDir" `
-                "/DVariant=$VariantTag" `
+            Invoke-Checked $IsccPath @(
+                "/DAppVersion=$Version",
+                "/DSourceDir=$DistAppDir",
+                "/DOutputDir=$ReleaseDir",
+                "/DVariant=$VariantTag",
                 (Join-Path $ScriptDir "installer.iss")
-            if ($LASTEXITCODE -ne 0) {
-                throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
-            }
+            )
             $SetupPath = Join-Path $ReleaseDir "Audio8-VC-${Version}-win64-${VariantTag}-setup.exe"
             Write-Host "Created: $SetupPath" -ForegroundColor Cyan
             $Artifacts += $SetupPath

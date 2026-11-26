@@ -36,9 +36,6 @@ hiddenimports: list[str] = [
     "clr",
     "clr_loader",
     "pythonnet",
-    "System",
-    "System.Drawing",
-    "System.Windows.Forms",
     # uvicorn / FastAPI / WebSocket dynamic modules
     "uvicorn.logging",
     "uvicorn.loops",
@@ -90,6 +87,19 @@ for pkg in ("a8vc", "uvicorn", "fastapi", "starlette", "websockets", "anyio", "h
         hiddenimports += collect_submodules(pkg)
     except Exception as exc:
         print(f"[audio8_vc.spec] Note: skipped collect_submodules({pkg!r}): {exc}")
+
+# Optional: bundle NVIDIA CUDA 12 / cuDNN 9 DLLs from `nvidia-*-cu12` wheels when requested
+if os.environ.get("A8VC_BUNDLE_CUDA_RUNTIME", "").strip().lower() in {"1", "true", "yes"}:
+    import importlib.util
+
+    nvidia_spec = importlib.util.find_spec("nvidia")
+    if nvidia_spec is not None and nvidia_spec.submodule_search_locations:
+        for loc in nvidia_spec.submodule_search_locations:
+            nvidia_root = Path(loc)
+            for dll_path in sorted(nvidia_root.glob("*/bin/*.dll")):
+                rel_dir = dll_path.parent.relative_to(nvidia_root)
+                binaries.append((str(dll_path), str(Path("nvidia") / rel_dir)))
+        print(f"[audio8_vc.spec] Collected optional NVIDIA CUDA runtime DLLs (total binaries={len(binaries)})")
 
 # Trim unrelated heavy packages and non-Windows GUI toolkits
 excludes = [

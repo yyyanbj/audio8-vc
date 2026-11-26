@@ -19,7 +19,7 @@
 #define AppPublisher "Audio8-VC"
 #define AppExeName "Audio8-VC.exe"
 #define AppCliName "a8vc.exe"
-#define AppURL "https://github.com/Edge0-AI/Audio8_TTS"
+#define AppURL "https://github.com/yyyanbj/audio8-vc"
 
 [Setup]
 AppId={{8E9A7B35-4E81-4B66-9A2E-6F20B8A0810B}
@@ -63,6 +63,10 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 Name: "associate"; Description: "Associate .a8voice voice pack files with Audio8-VC"; GroupDescription: "File associations:"; Flags: checkedonce
+
+[InstallDelete]
+; Clean previous bundled runtime when switching between CPU / DirectML / CUDA builds
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

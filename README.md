@@ -134,15 +134,19 @@ uv run a8vc desktop
 .\packaging\windows\build_windows.ps1
 # 或直接双击 packaging\windows\build_windows.bat
 
-# 2. DirectML GPU 加速版（支持 AMD / Intel / NVIDIA 显卡，自动将打包内默认 provider 设为 dml）
+# 2. DirectML GPU 通用加速版（推荐：支持 NVIDIA / AMD / Intel 显卡，免装 CUDA，自动启用 dml）
 .\packaging\windows\build_windows.ps1 -Provider dml
 
-# 3. 离线全量版（打包时预置 Audio8-0.1B + SenseVoice ASR + Silero VAD 模型，开箱断网可用）
-.\packaging\windows\build_windows.ps1 -Provider cpu -BundleModels -UseMirror
+# 3. NVIDIA CUDA GPU 加速版（onnxruntime-gpu，自动探测系统 CUDA 12 / cuDNN 9 与 cuda_libs）
+.\packaging\windows\build_windows.ps1 -Provider cuda
+# 如需在本地把 NVIDIA CUDA 12 + cuDNN 9 运行库一并打进自包含包，可追加 -BundleCudaRuntime
+
+# 4. 离线全量版（打包时预置 Audio8-0.1B + SenseVoice ASR + Silero VAD 模型，开箱断网可用）
+.\packaging\windows\build_windows.ps1 -Provider dml -BundleModels -UseMirror
 ```
 
 构建产物输出至 `dist\release\`：
-- `Audio8-VC-<version>-win64-<variant>-setup.exe`（Windows 安装向导程序）
+- `Audio8-VC-<version>-win64-<variant>-setup.exe`（Windows 安装向导程序，`<variant>` 为 `cpu` / `dml` / `cuda`）
 - `Audio8-VC-<version>-win64-<variant>-portable.zip`（解压即用的免安装便携版）
 - `SHA256SUMS.txt`（校验和）
 
@@ -150,8 +154,9 @@ uv run a8vc desktop
 
 仓库已配置 [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)：
 
-- 推送版本标签（如 `git tag v0.1.0 && git push origin v0.1.0`）自动在 `windows-latest` 运行单元测试、PyInstaller 打包、Inno Setup 编译、静默安装/卸载烟雾测试，并将安装包与便携 ZIP 发布至 GitHub Releases。
-- 也可在 GitHub Actions 页面手动触发 `Build Windows Installer`（支持选择 `cpu` / `dml` / `cuda` 与是否预打包离线模型 `bundle_models`）并直接下载构建产物。
+- 推送版本标签（如 `git tag v0.1.0 && git push origin v0.1.0`）自动在 `windows-latest` 并行构建 **CPU + DirectML GPU (`dml`) + NVIDIA CUDA GPU (`cuda`)** 三个版本，完成单元测试、PyInstaller 打包、Inno Setup 编译、静默安装/Provider 校验/卸载烟雾测试，并将全部安装包、便携 ZIP 与合并后的 `SHA256SUMS.txt` 发布至 GitHub Releases。
+- 也可在 GitHub Actions 页面手动触发 `Build Windows Installer`（支持选择 `all` / `cpu` / `dml` / `cuda` 与是否预打包离线模型 `bundle_models`）并直接下载构建产物。
+- 运行 `a8vc info` 可随时查看当前加速后端、可用 ONNX Execution Providers 与 CUDA 运行库探测结果。
 
 ### 在 Windows 游戏 / 语音软件中接入实时变声
 

@@ -7,11 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "ONNX Runtime execution provider"
+        description: "ONNX Runtime execution provider(s) to build"
         required: true
-        default: "cpu"
+        default: "all"
         type: choice
         options:
+          - all
           - cpu
           - dml
           - cuda
@@ -25,10 +26,31 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Resolve Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      providers: ${{ steps.matrix.outputs.providers }}
+    steps:
+      - name: Determine provider matrix
+        id: matrix
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.provider }}" != "all" ]]; then
+            echo 'providers=["${{ inputs.provider }}"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'providers=["cpu","dml","cuda"]' >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
-    name: Windows x64 Installer & Portable ZIP
+    name: Windows x64 (${{ matrix.provider }})
+    needs: prepare
     runs-on: windows-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: ${{ fromJson(needs.prepare.outputs.providers) }}
 
     steps:
       - name: Checkout repository
@@ -50,24 +72,26 @@ jobs:
           uv sync --extra dev
           uv run pytest -v
 
-      - name: Build Audio8-VC Windows installer & portable ZIP
+      - name: Build Audio8-VC Windows installer & portable ZIP (${{ matrix.provider }})
         shell: pwsh
         run: |
-          $provider = "${{ inputs.provider || 'cpu' }}"
-          $argsList = @("-Provider", $provider)
-          if ("${{ inputs.bundle_models }}" -eq "true") {
-            $argsList += "-BundleModels"
+          $params = @{
+            Provider = "${{ matrix.provider }}"
           }
-          & .\packaging\windows\build_windows.ps1 @argsList
+          if ("${{ inputs.bundle_models }}" -eq "true") {
+            $params.BundleModels = $true
+          }
+          & .\packaging\windows\build_windows.ps1 @params
 
-      - name: Smoke-test generated Windows setup installer
+      - name: Smoke-test generated Windows setup installer (${{ matrix.provider }})
         shell: pwsh
         run: |
+          $provider = "${{ matrix.provider }}"
           $setup = Get-ChildItem -Path "dist\release" -Filter "*-setup.exe" | Select-Object -First 1
           if (-not $setup) {
             throw "Expected Inno Setup installer (*-setup.exe) not found in dist\release"
           }
-          $testDir = Join-Path $env:RUNNER_TEMP "Audio8-VC-InstallTest"
+          $testDir = Join-Path $env:RUNNER_TEMP "Audio8-VC-InstallTest-$provider"
           Write-Host "Silently installing $($setup.Name) into $testDir ..."
           $proc = Start-Process -FilePath $setup.FullName -ArgumentList @(
             "/VERYSILENT",
@@ -82,15 +106,34 @@ jobs:
           if (-not (Test-Path (Join-Path $testDir "Audio8-VC.exe"))) {
             throw "Installed Audio8-VC.exe missing under $testDir"
           }
-          & (Join-Path $testDir "a8vc.exe") --version
+          $cli = Join-Path $testDir "a8vc.exe"
+          & $cli --version
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe --version failed with code $LASTEXITCODE"
           }
-          & (Join-Path $testDir "a8vc.exe") voice list
+          $infoRaw = & $cli info --json
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed a8vc.exe info --json failed with code $LASTEXITCODE"
+          }
+          $info = ($infoRaw -join "`n") | ConvertFrom-Json
+          Write-Host "Installed info: configured=$($info.configured_provider), asr=$($info.asr_provider), flavor=$($info.ort_flavor), providers=[$($info.available_providers -join ', ')]"
+          if ($info.configured_provider -ne $provider) {
+            throw "Installed configured_provider mismatch: expected '$provider', got '$($info.configured_provider)'"
+          }
+          if ($info.asr_provider -ne "cpu") {
+            throw "Installed asr_provider mismatch: expected 'cpu', got '$($info.asr_provider)'"
+          }
+          if ($provider -eq "dml" -and ($info.available_providers -notcontains "DmlExecutionProvider")) {
+            throw "Installed DirectML build missing DmlExecutionProvider"
+          }
+          if ($provider -eq "cuda" -and ($info.available_providers -notcontains "CUDAExecutionProvider")) {
+            throw "Installed CUDA build missing CUDAExecutionProvider"
+          }
+          & $cli voice list
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe voice list failed with code $LASTEXITCODE"
           }
-          & (Join-Path $testDir "a8vc.exe") devices
+          & $cli devices
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "a8vc.exe devices returned $LASTEXITCODE (expected on headless runner without audio endpoints)"
             $global:LASTEXITCODE = 0
@@ -100,16 +143,52 @@ jobs:
             Start-Process -FilePath $uninstaller -ArgumentList @("/VERYSILENT", "/NORESTART") -Wait
           }
 
-      - name: Upload Windows release artifacts
+      - name: Upload Windows release artifacts (${{ matrix.provider }})
         uses: actions/upload-artifact@v4
         with:
-          name: Audio8-VC-windows-x64-${{ inputs.provider || 'cpu' }}
-          path: dist/release/*
+          name: Audio8-VC-windows-x64-${{ matrix.provider }}
+          path: |
+            dist/release/*-setup.exe
+            dist/release/*-portable.zip
           if-no-files-found: error
 
-      - name: Publish GitHub Release (on version tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    name: Publish GitHub Release (CPU + DirectML GPU + CUDA GPU)
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all Windows build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Audio8-VC-windows-x64-*
+          path: release_staging
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS.txt
+        shell: bash
+        run: |
+          cd release_staging
+          ls -lh
+          sha256sum Audio8-VC-*.exe Audio8-VC-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/release/*
+          files: |
+            release_staging/Audio8-VC-*.exe
+            release_staging/Audio8-VC-*.zip
+            release_staging/SHA256SUMS.txt
           generate_release_notes: true
+          body: |
+            ### Windows 安装包版本选择指南
+
+            - **DirectML GPU 通用版 (`*-win64-dml-setup.exe` / `-portable.zip`) — 推荐大多数 Windows 显卡用户**
+              - 支持 **NVIDIA / AMD / Intel** DirectX 12 显卡加速，**无需手动安装 CUDA 或 cuDNN**，安装即用。
+            - **NVIDIA CUDA GPU 加速版 (`*-win64-cuda-setup.exe` / `-portable.zip`) — NVIDIA RTX 进阶用户**
+              - 基于 `onnxruntime-gpu`（CUDA 12 + cuDNN 9），自动探测系统 `CUDA_PATH`、`C:\Program Files\NVIDIA\CUDNN\v9.*` 及程序目录 `cuda_libs`；若未检测到 CUDA 12 / cuDNN 9 运行库将自动安全回退 CPU。
+            - **CPU 轻量通用版 (`*-win64-cpu-setup.exe` / `-portable.zip`)**
+              - 体积最小、零显卡驱动要求，纯 CPU 运行仅约 0.6 GiB RAM。
+
+            > 首次启动后可在桌面界面点击「**一键下载所需模型**」（内置国内 `hf-mirror.com` 加速镜像选项）。

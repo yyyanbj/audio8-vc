@@ -46,6 +46,7 @@ from a8vc.paths import (
     is_portable_mode,
 )
 from a8vc.runtime.audio8_onnx import Audio8OnnxRuntime, SynthesizerBackend
+from a8vc.runtime.providers import probe_provider_info
 from a8vc.voices.enroll import VoiceEnroller
 from a8vc.voices.store import VoiceLibrary
 
@@ -250,6 +251,16 @@ def create_app(
         asr_loaded = srv_state._asr is not None
         models_snapshot = srv_state.model_manager.status()
         live_status = srv_state.live_session.status()
+        active_provider = (
+            getattr(srv_state._synthesizer, "active_provider", None)
+            if synth_loaded
+            else None
+        )
+        provider_warning = (
+            getattr(srv_state._synthesizer, "provider_warning", None)
+            if synth_loaded
+            else None
+        )
         return {
             "status": "ok",
             "version": __version__,
@@ -257,6 +268,9 @@ def create_app(
             "desktop_mode": srv_state.desktop_mode,
             "synthesizer_loaded": synth_loaded,
             "asr_loaded": asr_loaded,
+            "configured_provider": srv_state.cfg.runtime.provider,
+            "active_provider": active_provider,
+            "provider_warning": provider_warning,
             "active_voice_id": srv_state.active_voice_id,
             "voice_count": len(srv_state.library.list_voices()),
             "registration": srv_state.enroller.status(),
@@ -269,6 +283,8 @@ def create_app(
     @app.get("/api/system/info")
     async def system_info() -> dict[str, Any]:
         data_dir = get_data_dir(desktop=srv_state.desktop_mode)
+        provider_info = probe_provider_info(srv_state.cfg.runtime.provider)
+        synth_loaded = srv_state._synthesizer is not None
         return {
             "version": __version__,
             "platform": sys.platform,
@@ -283,6 +299,18 @@ def create_app(
             "vad_model_path": str(srv_state.cfg.paths.vad_model_path),
             "logs_dir": str(get_logs_dir(desktop=srv_state.desktop_mode)),
             "provider": srv_state.cfg.runtime.provider,
+            "asr_provider": srv_state.cfg.asr.provider,
+            "active_provider": (
+                getattr(srv_state._synthesizer, "active_provider", None)
+                if synth_loaded
+                else None
+            ),
+            "provider_warning": (
+                getattr(srv_state._synthesizer, "provider_warning", None)
+                if synth_loaded
+                else None
+            ),
+            **provider_info,
         }
 
     @app.post("/api/system/open-dir")

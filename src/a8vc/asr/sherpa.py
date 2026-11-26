@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ import numpy as np
 from a8vc.asr.base import ASRBackend
 from a8vc.audio.io import ensure_mono_float32, resample_audio
 from a8vc.config import ASRConfig
+
+logger = logging.getLogger("a8vc.asr.sherpa")
 
 # Strip SenseVoice emotion/event tags such as <|zh|><|NEUTRAL|><|Speech|><|woitn|>
 _SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]+\|>")
@@ -68,13 +71,31 @@ class SherpaOnnxASR:
 
         self._sherpa = sherpa_onnx
         self._model_type = model_type
-        self._recognizer = self._build_recognizer(
-            root=root,
-            model_type=model_type,
-            language=language,
-            num_threads=num_threads,
-            provider=provider,
-        )
+        self.active_provider = provider
+        try:
+            self._recognizer = self._build_recognizer(
+                root=root,
+                model_type=model_type,
+                language=language,
+                num_threads=num_threads,
+                provider=provider,
+            )
+        except Exception as exc:
+            if provider == "cpu":
+                raise
+            logger.warning(
+                "sherpa-onnx ASR provider=%r failed (%s); falling back to CPU",
+                provider,
+                exc,
+            )
+            self.active_provider = "cpu"
+            self._recognizer = self._build_recognizer(
+                root=root,
+                model_type=model_type,
+                language=language,
+                num_threads=num_threads,
+                provider="cpu",
+            )
 
     @property
     def name(self) -> str:

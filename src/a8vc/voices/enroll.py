@@ -16,6 +16,7 @@ import numpy as np
 
 from a8vc.asr.base import ASRBackend
 from a8vc.audio.io import load_audio, load_audio_bytes, pad_to_multiple, resample_audio
+from a8vc.runtime.providers import create_onnx_session
 from a8vc.voices.format import VoicePack, build_voice_pack, validate_codes_array
 
 MIN_AUDIO_SECONDS = 0.5
@@ -82,8 +83,6 @@ class VoiceEnroller:
 
     def encode_waveform(self, audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, dict[str, Any]]:
         """Encode 1D float32 audio into `[10, T]` discrete codes using `codec_encoder_fp16.onnx`."""
-        import onnxruntime as ort
-
         _, encoder_path = self._registration_paths()
         if not encoder_path.is_file():
             raise FileNotFoundError(
@@ -108,29 +107,13 @@ class VoiceEnroller:
         padded = pad_to_multiple(resampled, multiple=hop_length)
         tensor = np.ascontiguousarray(padded.reshape(1, 1, -1))
 
-        opts = ort.SessionOptions()
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.intra_op_num_threads = self.threads
-        opts.inter_op_num_threads = max(1, self.threads // 2)
-        opts.log_severity_level = 3
-
-        available = set(ort.get_available_providers())
-        providers = ["CPUExecutionProvider"]
-        if self.provider == "cuda" and "CUDAExecutionProvider" in available:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        elif self.provider == "dml" and "DmlExecutionProvider" in available:
-            providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
-        elif self.provider == "coreml" and "CoreMLExecutionProvider" in available:
-            providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-        elif self.provider == "auto":
-            for ep in ("CUDAExecutionProvider", "CoreMLExecutionProvider", "DmlExecutionProvider"):
-                if ep in available:
-                    providers = [ep, "CPUExecutionProvider"]
-                    break
-
         session = None
         try:
-            session = ort.InferenceSession(str(encoder_path), sess_options=opts, providers=providers)
+            session, _, _ = create_onnx_session(
+                encoder_path,
+                provider=self.provider,
+                threads=self.threads,
+            )
             inp = session.get_inputs()[0]
             if inp.type == "tensor(float16)":
                 feed = tensor.astype(np.float16, copy=False)
