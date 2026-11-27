@@ -31,6 +31,7 @@ from a8vc import __version__
 from a8vc.config import AppConfig, load_config
 from a8vc.paths import (
     get_bundle_dir,
+    get_data_dir,
     get_executable_dir,
     get_icon_path,
     get_logs_dir,
@@ -467,6 +468,13 @@ def launch_desktop(
                 smoke_state["error"] = msg
             else:
                 try:
+                    if smoke_test and sys.platform == "win32":
+                        # Avoid GPU process hangs on headless Windows VMs without a physical GPU
+                        os.environ.setdefault(
+                            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                            "--disable-gpu --no-first-run",
+                        )
+
                     import webview
 
                     window = webview.create_window(
@@ -484,13 +492,24 @@ def launch_desktop(
                     _attach_window_event(events_obj, "loaded", loaded_event)
 
                     start_kwargs: dict[str, Any] = {}
+                    try:
+                        start_params = set(inspect.signature(webview.start).parameters.keys())
+                    except (TypeError, ValueError):
+                        start_params = set()
+
                     icon_file = select_webview_icon()
-                    if icon_file is not None:
+                    if icon_file is not None and "icon" in start_params:
+                        start_kwargs["icon"] = str(icon_file)
+                        smoke_state["icon_passed"] = str(icon_file)
+
+                    if "storage_path" in start_params and "private_mode" in start_params:
+                        wv_dir_name = f"webview2-smoke-{os.getpid()}" if smoke_test else "webview2"
+                        wv_storage = get_data_dir(desktop=True) / wv_dir_name
                         try:
-                            if "icon" in inspect.signature(webview.start).parameters:
-                                start_kwargs["icon"] = str(icon_file)
-                                smoke_state["icon_passed"] = str(icon_file)
-                        except (TypeError, ValueError):
+                            wv_storage.mkdir(parents=True, exist_ok=True)
+                            start_kwargs["storage_path"] = str(wv_storage)
+                            start_kwargs["private_mode"] = False
+                        except Exception:
                             pass
 
                     if sys.platform == "win32":

@@ -276,13 +276,13 @@ try {
         $env:A8VC_NO_DIALOG = "1"
         $guiProc = Start-Process -FilePath $BuiltGui -ArgumentList @(
             "--smoke-test",
-            "--smoke-timeout", "30",
+            "--smoke-timeout", "60",
             "--smoke-report", "`"$GuiSmokeReport`""
         ) -PassThru
         $null = $guiProc.Handle
-        if (-not $guiProc.WaitForExit(60000)) {
+        if (-not $guiProc.WaitForExit(90000)) {
             Stop-Process -Id $guiProc.Id -Force -ErrorAction SilentlyContinue
-            throw "Audio8-VC.exe --smoke-test timed out after 60 seconds"
+            throw "Audio8-VC.exe --smoke-test timed out after 90 seconds"
         }
         $guiProc.WaitForExit()
     }

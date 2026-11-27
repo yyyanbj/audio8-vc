@@ -121,13 +121,13 @@ function Invoke-DesktopGuiSmokeTest {
 
         $proc = Start-Process -FilePath $GuiExe -ArgumentList @(
             "--smoke-test",
-            "--smoke-timeout", "30",
+            "--smoke-timeout", "60",
             "--smoke-report", "`"$ReportPath`""
         ) -PassThru
         $null = $proc.Handle
-        if (-not $proc.WaitForExit(60000)) {
+        if (-not $proc.WaitForExit(90000)) {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            throw "Audio8-VC.exe --smoke-test timed out after 60s ($GuiExe)"
+            throw "Audio8-VC.exe --smoke-test timed out after 90s ($GuiExe)"
         }
         $proc.WaitForExit()
         if (-not (Test-Path $ReportPath)) {
