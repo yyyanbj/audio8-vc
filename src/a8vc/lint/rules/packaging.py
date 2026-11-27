@@ -274,6 +274,15 @@ def check_ps1_smoke_and_selfcheck(ctx: LintContext) -> list[LintFinding]:
                 hint='Add `Invoke-Checked $BuiltCli @("self-check")` to the smoke-test step.',
             )
         )
+    if "--smoke-test" not in text:
+        findings.append(
+            LintFinding(
+                rule_id="PKG005",
+                path=rel,
+                message="build_windows.ps1 must execute `Audio8-VC.exe --smoke-test` to verify GUI startup.",
+                hint="Launch `$BuiltGui --smoke-test --smoke-report ...` after `a8vc.exe self-check`.",
+            )
+        )
     return findings
 
 

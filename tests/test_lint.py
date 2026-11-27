@@ -310,3 +310,28 @@ def test_lint_cli_and_runner_json_output(capsys: object) -> None:
     assert rc2 == 0
     rules_json = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
     assert any(r["rule_id"] == "DEP002" for r in rules_json)
+    assert any(r["rule_id"] == "DSK001" for r in rules_json)
+    assert any(r["rule_id"] == "DSK002" for r in rules_json)
+
+
+def test_lint_catches_desktop_windows_gui_regressions(tmp_path: Path) -> None:
+    # DSK001: passing PNG to pywebview on Windows (exact v0.2.1 bug)
+    _write(
+        tmp_path,
+        "src/a8vc/desktop.py",
+        'icon_file = get_icon_path("png") or get_icon_path("ico")\n'
+        'webview.start(gui="edgechromium", icon=str(icon_file))\n',
+    )
+    rep_dsk1 = default_registry.run(tmp_path, select={"DSK001"})
+    assert any(f.rule_id == "DSK001" for f in rep_dsk1.findings)
+
+    # DSK002: missing MessageBoxW / --smoke-test in entry_desktop.py & desktop.py
+    _write(
+        tmp_path,
+        "packaging/windows/entry_desktop.py",
+        "from a8vc.desktop import main\nraise SystemExit(main())\n",
+    )
+    rep_dsk2 = default_registry.run(tmp_path, select={"DSK002"})
+    assert any(f.rule_id == "DSK002" and f.path == "packaging/windows/entry_desktop.py" for f in rep_dsk2.findings)
+    assert any(f.rule_id == "DSK002" and f.path == "src/a8vc/desktop.py" for f in rep_dsk2.findings)
+

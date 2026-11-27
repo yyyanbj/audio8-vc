@@ -75,6 +75,7 @@ def check_ci_gates(ctx: LintContext) -> list[LintFinding]:
         (r"ruff\s+check", "`ruff check`"),
         (r"pytest", "`pytest`"),
         (r"\$cli\s+self-check", "installed Windows executable smoke check (`& $cli self-check`)"),
+        (r"--smoke-test", "installed `Audio8-VC.exe --smoke-test` real GUI launch check"),
     ]
     for pattern, desc in required_checks:
         if not re.search(pattern, text):
@@ -223,6 +224,8 @@ def check_windows_e2e_harness(ctx: LintContext) -> list[LintFinding]:
             ("__stale_upgrade_sentinel__.dll", "[InstallDelete] upgrade cleanup verification"),
             ("unins000.exe", "silent uninstaller verification"),
             ("e2e_verify.py", "Python real-model & browser E2E runner invocation"),
+            ("--smoke-test", "real `Audio8-VC.exe --smoke-test` GUI window verification"),
+            ("Zone.Identifier", "Mark-of-the-Web (`Zone.Identifier`) portable ZIP unblock verification"),
         ):
             if token not in ps1_text:
                 findings.append(

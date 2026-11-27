@@ -145,8 +145,10 @@ def get_icon_path(ext: str = "ico") -> Path | None:
         get_static_dir() / static_name,
         get_bundle_dir() / "packaging" / "windows" / "assets" / filename,
         get_executable_dir() / "assets" / filename,
-        Path(__file__).resolve().parents[3] / "packaging" / "windows" / "assets" / filename,
     ]
+    resolved_parents = Path(__file__).resolve().parents
+    if len(resolved_parents) > 2:
+        candidates.append(resolved_parents[2] / "packaging" / "windows" / "assets" / filename)
     for path in candidates:
         if path.is_file():
             return path

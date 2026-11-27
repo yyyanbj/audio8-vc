@@ -171,6 +171,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe self-check failed with code $LASTEXITCODE"
           }
+          $gui = Join-Path $testDir "Audio8-VC.exe"
+          $guiReport = Join-Path $env:RUNNER_TEMP "installed-gui-smoke-$provider.json"
+          if (Test-Path $guiReport) { Remove-Item -Force $guiReport }
+          $env:A8VC_NO_DIALOG = "1"
+          $guiProc = Start-Process -FilePath $gui -ArgumentList @(
+            "--smoke-test",
+            "--smoke-timeout", "30",
+            "--smoke-report", "`"$guiReport`""
+          ) -PassThru
+          $null = $guiProc.Handle
+          if (-not $guiProc.WaitForExit(60000)) {
+            Stop-Process -Id $guiProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Installed Audio8-VC.exe --smoke-test timed out after 60s"
+          }
+          $guiProc.WaitForExit()
+          if (-not (Test-Path $guiReport)) {
+            throw "Installed Audio8-VC.exe --smoke-test exited ($($guiProc.ExitCode)) without writing $guiReport"
+          }
+          $guiRepRaw = Get-Content -Raw $guiReport
+          Write-Host "Installed Audio8-VC.exe smoke report ($provider): $guiRepRaw"
+          $guiRep = $guiRepRaw | ConvertFrom-Json
+          if ($guiProc.ExitCode -ne 0 -or -not $guiRep.ok -or -not $guiRep.shown -or -not $guiRep.loaded) {
+            throw "Installed Audio8-VC.exe GUI smoke test failed for $provider (exit=$($guiProc.ExitCode), error=$($guiRep.error))"
+          }
           & $cli voice list
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe voice list failed with code $LASTEXITCODE"

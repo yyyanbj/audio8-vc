@@ -94,6 +94,74 @@ function Assert-BundledLayout {
     Write-Host "  Verified executables, 6 brand icon assets, and unified onnxruntime.dll ($($ortDlls.Count) file(s), sha256=$($hashes[0].Substring(0, 12))...)" -ForegroundColor Cyan
 }
 
+function Invoke-DesktopGuiSmokeTest {
+    param(
+        [Parameter(Mandatory = $true)][string]$GuiExe,
+        [Parameter(Mandatory = $true)][string]$ReportPath,
+        [string]$DataDir = "",
+        [int]$ExpectedMinUnblocked = 0
+    )
+
+    if (-not (Test-Path $GuiExe)) {
+        throw "Expected GUI executable missing: $GuiExe"
+    }
+    if (Test-Path $ReportPath) {
+        Remove-Item -Force $ReportPath
+    }
+
+    $prevDataDir = $env:A8VC_DATA_DIR
+    $prevNoDialog = $env:A8VC_NO_DIALOG
+    try {
+        if ($DataDir) {
+            $env:A8VC_DATA_DIR = $DataDir
+        } else {
+            Remove-Item Env:A8VC_DATA_DIR -ErrorAction SilentlyContinue
+        }
+        $env:A8VC_NO_DIALOG = "1"
+
+        $proc = Start-Process -FilePath $GuiExe -ArgumentList @(
+            "--smoke-test",
+            "--smoke-timeout", "30",
+            "--smoke-report", "`"$ReportPath`""
+        ) -PassThru
+        $null = $proc.Handle
+        if (-not $proc.WaitForExit(60000)) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Audio8-VC.exe --smoke-test timed out after 60s ($GuiExe)"
+        }
+        $proc.WaitForExit()
+        if (-not (Test-Path $ReportPath)) {
+            throw "Audio8-VC.exe --smoke-test exited with code $($proc.ExitCode) without creating $ReportPath"
+        }
+        $raw = Get-Content -Raw $ReportPath
+        Write-Host "  GUI smoke report ($GuiExe): $raw" -ForegroundColor Cyan
+        $rep = $raw | ConvertFrom-Json
+        if ($proc.ExitCode -ne 0 -or -not $rep.ok -or -not $rep.shown -or -not $rep.loaded -or -not $rep.icon_ok) {
+            if ($rep.log_file -and (Test-Path $rep.log_file)) {
+                Write-Host "  --- Tail of a8vc-desktop.log ---" -ForegroundColor Yellow
+                Get-Content -Tail 60 $rep.log_file
+            }
+            throw "Audio8-VC.exe GUI smoke test failed (exit=$($proc.ExitCode), error=$($rep.error))"
+        }
+        if ($ExpectedMinUnblocked -gt 0 -and ([int]$rep.unblocked_dlls -lt $ExpectedMinUnblocked)) {
+            throw "Expected Audio8-VC.exe to unblock >= $ExpectedMinUnblocked MOTW DLLs, got $($rep.unblocked_dlls)"
+        }
+        Write-Host "  Verified Audio8-VC.exe native window launched & loaded UI (renderer=$($rep.renderer), unblocked_dlls=$($rep.unblocked_dlls))." -ForegroundColor Cyan
+    }
+    finally {
+        if ($null -ne $prevDataDir) {
+            $env:A8VC_DATA_DIR = $prevDataDir
+        } else {
+            Remove-Item Env:A8VC_DATA_DIR -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $prevNoDialog) {
+            $env:A8VC_NO_DIALOG = $prevNoDialog
+        } else {
+            Remove-Item Env:A8VC_NO_DIALOG -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function New-SafeJunction {
     param(
         [Parameter(Mandatory = $true)][string]$LinkPath,
@@ -199,6 +267,12 @@ try {
     $JunctionsToClean.Add($InstallModelsJunction)
 
     $InstalledCli = Join-Path $InstallDir "a8vc.exe"
+    $InstalledGui = Join-Path $InstallDir "Audio8-VC.exe"
+    Invoke-DesktopGuiSmokeTest `
+        -GuiExe $InstalledGui `
+        -ReportPath (Join-Path $WorkRoot "installed_gui_smoke.json") `
+        -DataDir $InstallDataDir
+
     Invoke-Checked "uv" @(
         "run", "python", "scripts\e2e_verify.py",
         "--cli", $InstalledCli,
@@ -260,6 +334,31 @@ try {
     $PortableModelsJunction = Join-Path $PortableDir "data\models"
     New-SafeJunction -LinkPath $PortableModelsJunction -TargetPath $ResolvedModelsCache
     $JunctionsToClean.Add($PortableModelsJunction)
+
+    # Simulate Windows Explorer Mark-of-the-Web (Zone.Identifier ADS) on downloaded Portable ZIP DLLs
+    $MotwNames = @(
+        "Python.Runtime.dll",
+        "Microsoft.Web.WebView2.Core.dll",
+        "Microsoft.Web.WebView2.WinForms.dll"
+    )
+    $MotwTargets = @(
+        Get-ChildItem -Path (Join-Path $PortableDir "_internal") -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $MotwNames -contains $_.Name }
+    )
+    $MotwApplied = 0
+    foreach ($dllItem in $MotwTargets) {
+        Set-Content -Path $dllItem.FullName -Stream "Zone.Identifier" -Value "[ZoneTransfer]`r`nZoneId=3`r`n" -Encoding Ascii
+        $MotwApplied += 1
+    }
+    if ($MotwApplied -lt 3) {
+        throw "Expected >= 3 managed DLLs ($($MotwNames -join ', ')) for MOTW Zone.Identifier verification, found $MotwApplied"
+    }
+    Write-Host "  Attached Mark-of-the-Web (Zone.Identifier ZoneId=3) to $MotwApplied portable DLLs." -ForegroundColor Yellow
+
+    Invoke-DesktopGuiSmokeTest `
+        -GuiExe (Join-Path $PortableDir "Audio8-VC.exe") `
+        -ReportPath (Join-Path $WorkRoot "portable_gui_smoke.json") `
+        -ExpectedMinUnblocked $MotwApplied
 
     Invoke-Checked "uv" @(
         "run", "python", "scripts\e2e_verify.py",

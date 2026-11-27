@@ -257,6 +257,62 @@ try {
     }
     Invoke-Checked $BuiltCli @("self-check")
 
+    # Smoke-test built GUI executable (`Audio8-VC.exe`: real WinForms + WebView2 window launch)
+    Write-Host "Running GUI desktop smoke test on built Audio8-VC.exe..." -ForegroundColor Green
+    $BuiltGui = Join-Path $DistAppDir "Audio8-VC.exe"
+    if (-not (Test-Path $BuiltGui)) {
+        throw "Expected built GUI executable missing: $BuiltGui"
+    }
+    $GuiSmokeReport = Join-Path $RepoRoot "build\gui_smoke_report.json"
+    $GuiSmokeData = Join-Path $RepoRoot "build\gui_smoke_data"
+    if (Test-Path $GuiSmokeReport) { Remove-Item -Force $GuiSmokeReport }
+    if (Test-Path $GuiSmokeData) { Remove-Item -Recurse -Force $GuiSmokeData }
+    New-Item -ItemType Directory -Force -Path $GuiSmokeData | Out-Null
+
+    $prevBuildDataDir = $env:A8VC_DATA_DIR
+    $prevBuildNoDialog = $env:A8VC_NO_DIALOG
+    try {
+        $env:A8VC_DATA_DIR = $GuiSmokeData
+        $env:A8VC_NO_DIALOG = "1"
+        $guiProc = Start-Process -FilePath $BuiltGui -ArgumentList @(
+            "--smoke-test",
+            "--smoke-timeout", "30",
+            "--smoke-report", "`"$GuiSmokeReport`""
+        ) -PassThru
+        $null = $guiProc.Handle
+        if (-not $guiProc.WaitForExit(60000)) {
+            Stop-Process -Id $guiProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Audio8-VC.exe --smoke-test timed out after 60 seconds"
+        }
+        $guiProc.WaitForExit()
+    }
+    finally {
+        if ($null -ne $prevBuildDataDir) {
+            $env:A8VC_DATA_DIR = $prevBuildDataDir
+        } else {
+            Remove-Item Env:A8VC_DATA_DIR -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $prevBuildNoDialog) {
+            $env:A8VC_NO_DIALOG = $prevBuildNoDialog
+        } else {
+            Remove-Item Env:A8VC_NO_DIALOG -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not (Test-Path $GuiSmokeReport)) {
+        throw "Audio8-VC.exe --smoke-test exited ($($guiProc.ExitCode)) without writing $GuiSmokeReport"
+    }
+    $guiRepRaw = Get-Content -Raw $GuiSmokeReport
+    Write-Host "GUI smoke report: $guiRepRaw" -ForegroundColor Cyan
+    $guiRep = $guiRepRaw | ConvertFrom-Json
+    if ($guiProc.ExitCode -ne 0 -or -not $guiRep.ok -or -not $guiRep.shown -or -not $guiRep.loaded) {
+        if ($guiRep.log_file -and (Test-Path $guiRep.log_file)) {
+            Write-Host "--- Tail of a8vc-desktop.log ---" -ForegroundColor Yellow
+            Get-Content -Tail 60 $guiRep.log_file
+        }
+        throw "Audio8-VC.exe GUI smoke test failed (exit=$($guiProc.ExitCode), error=$($guiRep.error))"
+    }
+    Write-Host "Verified Audio8-VC.exe opened native WebView window (renderer=$($guiRep.renderer), title=$($guiRep.js_title), icon_ok=$($guiRep.icon_ok))." -ForegroundColor Cyan
+
     $Artifacts = @()
 
     # 6. Create Portable ZIP (includes portable.flag so all data stays inside ./data)

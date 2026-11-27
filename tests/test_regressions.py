@@ -196,3 +196,160 @@ def test_icon_endpoints_serve_valid_svg_png_and_ico(tmp_path: Path) -> None:
         r_html = client.get("/")
         assert r_html.status_code == 200
         assert 'src="/icon.svg"' in r_html.text
+
+
+def test_select_webview_icon_never_passes_png_on_windows() -> None:
+    from a8vc.desktop import select_webview_icon
+
+    assert select_webview_icon(platform="win32", frozen=True) is None
+    win_dev_icon = select_webview_icon(platform="win32", frozen=False)
+    assert win_dev_icon is not None
+    assert win_dev_icon.suffix.lower() == ".ico"
+
+    linux_icon = select_webview_icon(platform="linux", frozen=False)
+    assert linux_icon is not None
+    assert linux_icon.suffix.lower() == ".png"
+
+
+def test_unblock_windows_bundle_dlls_strips_zone_identifier(tmp_path: Path) -> None:
+    from a8vc.desktop import unblock_windows_bundle_dlls
+
+    dll1 = tmp_path / "_internal" / "pythonnet" / "runtime" / "Python.Runtime.dll"
+    dll2 = tmp_path / "_internal" / "webview" / "lib" / "Microsoft.Web.WebView2.Core.dll"
+    dll1.parent.mkdir(parents=True)
+    dll2.parent.mkdir(parents=True)
+    dll1.write_bytes(b"mz")
+    dll2.write_bytes(b"mz")
+
+    seen: list[str] = []
+
+    def _fake_delete(ads_path: str) -> bool:
+        seen.append(ads_path)
+        return True
+
+    count = unblock_windows_bundle_dlls([tmp_path], delete_ads=_fake_delete)
+    assert count == 2
+    assert f"{dll1}:Zone.Identifier" in seen
+    assert f"{dll2}:Zone.Identifier" in seen
+
+
+def test_desktop_smoke_test_and_unshown_browser_fallback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import sys
+    import threading
+    import types
+
+    from a8vc import desktop
+
+    class _FakeEvent:
+        def __init__(self) -> None:
+            self._ev = threading.Event()
+            self._cbs: list[Any] = []
+
+        def __iadd__(self, fn: Any) -> _FakeEvent:
+            self._cbs.append(fn)
+            return self
+
+        def set(self) -> None:
+            self._ev.set()
+            for cb in self._cbs:
+                cb()
+
+        def is_set(self) -> bool:
+            return self._ev.is_set()
+
+    class _FakeWindow:
+        def __init__(self) -> None:
+            self.events = types.SimpleNamespace(shown=_FakeEvent(), loaded=_FakeEvent())
+            self.destroyed = False
+
+        def evaluate_js(self, _script: str) -> str:
+            return json.dumps(
+                {
+                    "title": "Audio8-VC 实时变声器",
+                    "iconOk": True,
+                    "hasStatus": True,
+                }
+            )
+
+        def destroy(self) -> None:
+            self.destroyed = True
+
+    def _make_fake_webview(*, fire_shown: bool) -> Any:
+        mod = types.ModuleType("webview")
+        mod.renderer = "edgechromium"  # type: ignore[attr-defined]
+        holder: dict[str, Any] = {}
+
+        def _create_window(**_kwargs: Any) -> _FakeWindow:
+            w = _FakeWindow()
+            holder["win"] = w
+            return w
+
+        def _start(func: Any = None, gui: Any = None, icon: Any = None) -> None:
+            holder["start_kwargs"] = {"gui": gui, "icon": icon}
+            if fire_shown:
+                holder["win"].events.shown.set()
+                holder["win"].events.loaded.set()
+                if func is not None:
+                    func()
+
+        mod.create_window = _create_window  # type: ignore[attr-defined]
+        mod.start = _start  # type: ignore[attr-defined]
+        mod._holder = holder  # type: ignore[attr-defined]
+        return mod
+
+    cfg = AppConfig()
+    cfg.paths.voices_dir = tmp_path / "voices"
+    monkeypatch.setenv("A8VC_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("A8VC_NO_DIALOG", "1")
+    monkeypatch.setattr(desktop, "has_windows_webview2", lambda: True)
+
+    # 1. Healthy GUI smoke-test passes and writes JSON report
+    good_wv = _make_fake_webview(fire_shown=True)
+    monkeypatch.setitem(sys.modules, "webview", good_wv)
+    report_ok = tmp_path / "smoke_ok.json"
+    rc_ok = desktop.launch_desktop(
+        cfg,
+        port=0,
+        smoke_test=True,
+        smoke_timeout=5.0,
+        smoke_report=report_ok,
+    )
+    assert rc_ok == 0
+    rep = json.loads(report_ok.read_text(encoding="utf-8"))
+    assert rep["ok"] is True
+    assert rep["shown"] is True
+    assert rep["loaded"] is True
+    assert rep["icon_ok"] is True
+    assert good_wv._holder["win"].destroyed is True
+
+    # 2. If webview.start() returns before `shown` fires, smoke-test FAILS (exit 1)
+    bad_wv = _make_fake_webview(fire_shown=False)
+    monkeypatch.setitem(sys.modules, "webview", bad_wv)
+    report_bad = tmp_path / "smoke_bad.json"
+    rc_bad = desktop.launch_desktop(
+        cfg,
+        port=0,
+        smoke_test=True,
+        smoke_timeout=5.0,
+        smoke_report=report_bad,
+    )
+    assert rc_bad == 1
+    rep_bad = json.loads(report_bad.read_text(encoding="utf-8"))
+    assert rep_bad["ok"] is False
+    assert rep_bad["shown"] is False
+
+    # 3. In normal mode, unshown webview MUST fall back to webbrowser.open()
+    opened_urls: list[str] = []
+
+    def _fake_open(url: str) -> bool:
+        opened_urls.append(url)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(desktop.webbrowser, "open", _fake_open)
+    rc_fb = desktop.launch_desktop(cfg, port=0, smoke_test=False)
+    assert rc_fb == 0
+    assert len(opened_urls) == 1
+    assert opened_urls[0].startswith("http://127.0.0.1:")
+
