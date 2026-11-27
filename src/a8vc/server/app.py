@@ -66,7 +66,9 @@ class TTSStreamRequest(BaseModel):
     temperature: float | None = Field(default=None, gt=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=1, le=4096)
+    max_new_tokens: int | None = Field(default=None, ge=16, le=2048)
     chunk_frames: int | None = Field(default=None, ge=2, le=64)
+    seed: int | None = None
 
 
 class ActiveVoiceRequest(BaseModel):
@@ -701,7 +703,9 @@ def create_app(
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=req.top_k,
+            max_new_tokens=req.max_new_tokens,
             chunk_frames=req.chunk_frames,
+            seed=req.seed,
         )
 
         # Prime the first chunk before committing HTTP 200 headers so prefill/runtime errors

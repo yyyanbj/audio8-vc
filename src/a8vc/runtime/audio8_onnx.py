@@ -32,6 +32,29 @@ _SLOW_OUTPUTS = {"logits", "hidden", "key_delta", "value_delta", "next_conv_stat
 _FAST_BASE_INPUTS = {"slow_hidden", "token_id", "use_slow_hidden", "input_pos"}
 
 
+def estimate_max_audio_frames(text: str, *, hard_cap: int = 512) -> int:
+    """Compute a generous text-proportional frame ceiling (~21.53 fps) to prevent runaway AR decoding.
+
+    When Audio8-0.1B stochastically misses `<|im_end|>` on a short phrase, bounding steps
+    proportionally to CJK/non-CJK text length avoids 24-second babble stalls on CPU while
+    leaving >=3x duration headroom for normal speech.
+    """
+    cap = max(32, int(hard_cap))
+    stripped = text.strip()
+    if not stripped:
+        return min(cap, 96)
+    cjk_chars = sum(
+        1
+        for ch in stripped
+        if ("一" <= ch <= "鿿")
+        or ("぀" <= ch <= "ヿ")
+        or ("가" <= ch <= "힯")
+    )
+    other_chars = len(stripped) - cjk_chars
+    est = int(cjk_chars * 10 + other_chars * 3.5 + 88)
+    return min(cap, max(96, est))
+
+
 @dataclass(slots=True)
 class StreamAudioChunk:
     """One streamed audio chunk yielded by the Audio8 synthesizer."""
@@ -459,7 +482,11 @@ class Audio8OnnxRuntime:
         temp = self.cfg.temperature if temperature is None else temperature
         p_val = self.cfg.top_p if top_p is None else top_p
         k_val = self.cfg.top_k if top_k is None else top_k
-        max_steps = self.cfg.max_new_tokens if max_new_tokens is None else max_new_tokens
+        max_steps = (
+            estimate_max_audio_frames(text, hard_cap=self.cfg.max_new_tokens)
+            if max_new_tokens is None
+            else max_new_tokens
+        )
         emit_every = max(2, self.cfg.chunk_frames if chunk_frames is None else chunk_frames)
         context_frames = min(self.cfg.stream_context_frames, self.manifest.stream_context_frames)
         guard_frames = self.cfg.stream_guard_frames

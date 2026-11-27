@@ -143,11 +143,15 @@ class CascadedVCEngine(VoiceConversionEngine):
             return
 
         self._segments_processed += 1
+        seg_sec = segment.audio.size / max(1, segment.sample_rate)
+        cfg_max_tokens = getattr(getattr(self._synth, "cfg", None), "max_new_tokens", 512)
+        vc_max_tokens = min(int(cfg_max_tokens), max(96, int((seg_sec * 2.5 + 2.5) * 22)))
         first_chunk = True
         for chunk in self._synth.stream_audio(
             transcript,
             voice,
             cancel_event=self._cancel_event,
+            max_new_tokens=vc_max_tokens,
         ):
             if self._cancel_event.is_set():
                 return

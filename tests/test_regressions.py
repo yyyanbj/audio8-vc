@@ -353,3 +353,16 @@ def test_desktop_smoke_test_and_unshown_browser_fallback(
     assert len(opened_urls) == 1
     assert opened_urls[0].startswith("http://127.0.0.1:")
 
+
+def test_estimate_max_audio_frames_bounds_short_utterances() -> None:
+    from a8vc.runtime.audio8_onnx import estimate_max_audio_frames
+
+    short_en = estimate_max_audio_frames("Hello browser test.", hard_cap=512)
+    short_zh = estimate_max_audio_frames("你好世界", hard_cap=512)
+    long_text = estimate_max_audio_frames("今天天气不错，" * 20, hard_cap=512)
+
+    assert 120 <= short_en <= 180
+    assert 100 <= short_zh <= 160
+    assert long_text == 512
+
+

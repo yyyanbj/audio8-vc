@@ -109,7 +109,11 @@ def _prepare_fake_mic_wavs(
     work_dir: Path,
 ) -> tuple[Path, Path, np.ndarray]:
     """Build 44.1kHz enrollment WAV + 16kHz Chromium fake-mic WAV + 48kHz WS test signal."""
-    # Trim extreme silence tails slightly while keeping clean speech, then normalize
+    # Trim extreme silence tails slightly while keeping clean speech, then normalize.
+    # Cap clip length to <=4.0s so enrollment, /ws/vc, and fake-mic stay deterministic on CPU.
+    max_samples = int(4.0 * speech_sr)
+    if speech_44k.size > max_samples:
+        speech_44k = speech_44k[:max_samples]
     peak = float(np.max(np.abs(speech_44k))) if speech_44k.size else 0.0
     if peak < 1e-4:
         raise RuntimeError("Synthesized speech audio is silent; cannot prepare E2E speech WAV")
@@ -553,6 +557,10 @@ def _phase_server_api_and_ws(
             json={
                 "voice_id": tts_voice,
                 "text": "Hello world, voice changer test.",
+                "temperature": 0.4,
+                "top_p": 0.85,
+                "max_new_tokens": 120,
+                "seed": 42,
             },
         )
         tts_ms = (time.perf_counter() - t0) * 1000.0
