@@ -4,7 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Audio8-VC 实时变声器</title>
-  <link rel="icon" href="/favicon.ico" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="icon" type="image/png" sizes="256x256" href="/icon.png" />
+  <link rel="alternate icon" href="/favicon.ico" />
   <style>
     :root {
       --bg: #0d1017;
@@ -35,6 +37,18 @@
       align-items: flex-start;
       flex-wrap: wrap;
       gap: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .brand-icon {
+      width: 46px;
+      height: 46px;
+      border-radius: 12px;
+      flex-shrink: 0;
+      box-shadow: 0 4px 16px rgba(79, 140, 255, 0.25);
     }
     h1 { margin: 0 0 4px; font-size: 21px; letter-spacing: 0.2px; }
     .sub { color: var(--muted); font-size: 12.5px; margin: 0; }
@@ -220,15 +234,18 @@
 <body>
   <div class="wrap">
     <div class="header">
-      <div>
-        <h1>Audio8-VC 实时变声器</h1>
-        <p class="sub">Edge0-AI Audio8-TTS-0.1B (ONNX INT8) · 独立 <code>.a8voice</code> 音色包 · 低内存前缀缓存</p>
-        <div class="pill-bar">
-          <span class="pill" id="pill-status">检测服务中...</span>
-          <span class="pill" id="pill-provider">加速后端: --</span>
-          <span class="pill" id="pill-rss">RSS: -- MB</span>
-          <span class="pill" id="pill-cache">前缀缓存: --</span>
-          <span class="pill" id="pill-mode">模式: --</span>
+      <div class="brand">
+        <img class="brand-icon" src="/icon.svg" alt="Audio8-VC" width="46" height="46" />
+        <div>
+          <h1>Audio8-VC 实时变声器</h1>
+          <p class="sub">Edge0-AI Audio8-TTS-0.1B (ONNX INT8) · 独立 <code>.a8voice</code> 音色包 · 低内存前缀缓存</p>
+          <div class="pill-bar">
+            <span class="pill" id="pill-status">检测服务中...</span>
+            <span class="pill" id="pill-provider">加速后端: --</span>
+            <span class="pill" id="pill-rss">RSS: -- MB</span>
+            <span class="pill" id="pill-cache">前缀缓存: --</span>
+            <span class="pill" id="pill-mode">模式: --</span>
+          </div>
         </div>
       </div>
       <div class="toolbar">
@@ -429,7 +446,11 @@
     let ws = null;
     let audioCtx = null;
     let micStream = null;
+    let micSource = null;
     let processor = null;
+    let zeroGain = null;
+    let wsReadyForAudio = false;
+    let lastWsError = "";
     let outSampleRate = 44100;
     let nextPlayTime = 0;
     let localRunning = false;
@@ -442,6 +463,38 @@
     function log(msg) {
       const ts = new Date().toLocaleTimeString();
       logEl.textContent = `[${ts}] ${msg}\n` + logEl.textContent.slice(0, 8000);
+    }
+
+    async function parseApiResponse(res) {
+      const rawText = await res.text();
+      let data = null;
+      if (rawText) {
+        try {
+          data = JSON.parse(rawText);
+        } catch (_err) {
+          data = null;
+        }
+      }
+      const detail =
+        (data && typeof data === "object" && (data.detail || data.message || data.error)) ||
+        (rawText && rawText.trim().slice(0, 300)) ||
+        `HTTP ${res.status}`;
+      return { ok: res.ok, status: res.status, data, detail };
+    }
+
+    async function ensureAudioContext() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) {
+        throw new Error("当前浏览器不支持 Web Audio API");
+      }
+      if (!audioCtx || audioCtx.state === "closed") {
+        audioCtx = new AudioCtx();
+        nextPlayTime = audioCtx.currentTime;
+      }
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+      return audioCtx;
     }
 
     document.getElementById("btn-clear-log").onclick = () => { logEl.textContent = ""; };
@@ -482,9 +535,9 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ target })
         });
-        const data = await res.json();
-        if (!res.ok) { log("打开目录失败: " + (data.detail || res.status)); return; }
-        log(`已打开目录: ${data.path}`);
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok) { log("打开目录失败: " + parsed.detail); return; }
+        log(`已打开目录: ${parsed.data.path}`);
       } catch (e) {
         log("打开目录失败: " + e);
       }
@@ -524,8 +577,13 @@
     async function refreshHealth() {
       try {
         const [hRes, sysRes] = await Promise.all([fetch("/api/health"), fetch("/api/system/info")]);
-        const data = await hRes.json();
-        const sys = await sysRes.json();
+        const hParsed = await parseApiResponse(hRes);
+        const sysParsed = await parseApiResponse(sysRes);
+        if (!hParsed.ok || !hParsed.data || !sysParsed.ok || !sysParsed.data) {
+          throw new Error(hParsed.detail || sysParsed.detail);
+        }
+        const data = hParsed.data;
+        const sys = sysParsed.data;
         const pill = document.getElementById("pill-status");
         pill.textContent = `状态: ${data.status} (v${data.version})`;
         pill.className = "pill ok";
@@ -565,7 +623,11 @@
     async function refreshModels() {
       try {
         const res = await fetch("/api/models/status");
-        const data = await res.json();
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) {
+          throw new Error(parsed.detail);
+        }
+        const data = parsed.data;
         const m = data.models;
         const dl = data.download;
         updatePill("m-audio8", "Audio8-0.1B ONNX", m.audio8_onnx.ready);
@@ -619,23 +681,31 @@
         use_mirror: document.getElementById("chk-mirror").checked
       };
       log("开始后台下载模型...");
-      const res = await fetch("/api/models/download", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        log("启动下载失败: " + (data.detail || res.status));
-        return;
+      try {
+        const res = await fetch("/api/models/download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok) {
+          log("启动下载失败: " + parsed.detail);
+          return;
+        }
+        await refreshModels();
+      } catch (e) {
+        log("启动下载异常: " + e);
       }
-      await refreshModels();
     };
 
     async function refreshDevices() {
       try {
         const res = await fetch("/api/devices");
-        const data = await res.json();
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) {
+          throw new Error(parsed.detail);
+        }
+        const data = parsed.data;
         const prevIn = localInSelect.value;
         const prevOut = localOutSelect.value;
         localInSelect.innerHTML = "";
@@ -702,11 +772,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ voice_ids: voiceIds, overwrite })
         });
-        const data = await res.json();
-        if (!res.ok) {
-          log("导入内置音色失败: " + (data.detail || res.status));
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) {
+          log("导入内置音色失败: " + parsed.detail);
           return;
         }
+        const data = parsed.data;
         const n = (data.installed || []).length;
         const skipped = (data.skipped || []).length;
         log(`内置音色导入完成：新增 ${n} 个，已存在跳过 ${skipped} 个。`);
@@ -788,14 +859,21 @@
     }
 
     async function refreshVoices() {
-      const [res, bRes] = await Promise.all([fetch("/api/voices"), fetch("/api/voices/builtins")]);
-      const data = await res.json();
-      const bData = bRes.ok ? await bRes.json() : { builtins: [] };
-      builtinCatalog = bData.builtins || [];
-      const builtinMap = new Map(builtinCatalog.map(b => [b.voice_id, b]));
-      document.getElementById("tab-voices-builtins").textContent = `内置开源音色库 (${builtinCatalog.length})`;
-      document.getElementById("tab-voices-installed").textContent = `已安装音色 (${data.voices.filter(v => !v.error).length})`;
-      renderBuiltinVoices();
+      try {
+        const [res, bRes] = await Promise.all([fetch("/api/voices"), fetch("/api/voices/builtins")]);
+        const vParsed = await parseApiResponse(res);
+        const bParsed = await parseApiResponse(bRes);
+        if (!vParsed.ok || !vParsed.data) {
+          log("读取音色列表失败: " + vParsed.detail);
+          return;
+        }
+        const data = vParsed.data;
+        const bData = (bParsed.ok && bParsed.data) ? bParsed.data : { builtins: [] };
+        builtinCatalog = bData.builtins || [];
+        const builtinMap = new Map(builtinCatalog.map(b => [b.voice_id, b]));
+        document.getElementById("tab-voices-builtins").textContent = `内置开源音色库 (${builtinCatalog.length})`;
+        document.getElementById("tab-voices-installed").textContent = `已安装音色 (${data.voices.filter(v => !v.error).length})`;
+        renderBuiltinVoices();
 
       const prev = voiceSelect.value || data.active_voice_id || "";
       voiceSelect.innerHTML = "";
@@ -870,9 +948,18 @@
         delBtn.textContent = "删除";
         delBtn.className = "danger small";
         delBtn.onclick = async () => {
-          await fetch(`/api/voices/${encodeURIComponent(v.voice_id)}`, { method: "DELETE" });
-          log(`已删除音色: ${v.voice_id}`);
-          await refreshVoices();
+          try {
+            const dRes = await fetch(`/api/voices/${encodeURIComponent(v.voice_id)}`, { method: "DELETE" });
+            const dParsed = await parseApiResponse(dRes);
+            if (!dParsed.ok) {
+              log(`删除音色失败 (${v.voice_id}): ${dParsed.detail}`);
+              return;
+            }
+            log(`已删除音色: ${v.voice_id}`);
+            await refreshVoices();
+          } catch (e) {
+            log(`删除音色异常 (${v.voice_id}): ${e}`);
+          }
         };
         actions.appendChild(useBtn);
         actions.appendChild(dlLink);
@@ -882,6 +969,9 @@
         row.appendChild(actions);
         voiceListEl.appendChild(row);
       }
+      } catch (e) {
+        log("刷新音色列表异常: " + e);
+      }
     }
     document.getElementById("btn-refresh-voices").onclick = refreshVoices;
     document.getElementById("btn-install-all-builtins").onclick = () => installBuiltins(null, false);
@@ -890,7 +980,9 @@
     async function pollLocalStatus() {
       try {
         const res = await fetch("/api/live/status");
-        const st = await res.json();
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) return;
+        const st = parsed.data;
         localRunning = Boolean(st.running);
         btnLocalStart.disabled = localRunning || !devicesAvailable;
         btnLocalStop.disabled = !localRunning;
@@ -905,6 +997,9 @@
           if (st.last_transcript) {
             line += `\n最近识别: "${st.last_transcript}"`;
           }
+          if (st.last_error) {
+            line += `\n最近错误: ${st.last_error}`;
+          }
           localMetricsEl.textContent = line;
         } else {
           localMetricsEl.textContent = st.last_error ? `已停止 (最近错误: ${st.last_error})` : "状态：未启动";
@@ -918,6 +1013,8 @@
                 log(`[本机识别 ${ev.asr_ms}ms] "${ev.text}"`);
               } else if (ev.type === "voice_changed") {
                 log(`[本机变声] 热切换音色 -> ${ev.voice_id} (预热 ${ev.warm_ms}ms)`);
+              } else if (ev.type === "error") {
+                log(`[本机变声错误] ${ev.message}`);
               }
             }
           }
@@ -942,18 +1039,20 @@
             output_device: localOutSelect.value
           })
         });
-        const data = await res.json();
-        if (!res.ok) {
-          log("启动本机变声失败: " + (data.detail || res.status));
-          localMetricsEl.textContent = "启动失败: " + (data.detail || res.status);
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) {
+          log("启动本机变声失败: " + parsed.detail);
+          localMetricsEl.textContent = "启动失败: " + parsed.detail;
           btnLocalStart.disabled = false;
           return;
         }
+        const data = parsed.data;
         log(`本机实时变声已启动，音色: ${data.voice_id} (${data.active_input_sample_rate}Hz -> ${data.active_output_sample_rate}Hz)`);
         await pollLocalStatus();
         await refreshHealth();
       } catch (e) {
         log("启动本机变声异常: " + e);
+        localMetricsEl.textContent = "启动异常: " + e;
         btnLocalStart.disabled = false;
       }
     };
@@ -974,31 +1073,42 @@
       const vid = voiceSelect.value;
       if (!vid) return;
       if (localRunning) {
-        const res = await fetch("/api/live/voice", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ voice_id: vid })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          log("热切换音色失败: " + (data.detail || res.status));
-        } else {
-          log(`本机变声已热切换至 ${data.voice_id} (预热 ${data.warm_ms}ms)`);
-          await refreshVoices();
+        try {
+          const res = await fetch("/api/live/voice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ voice_id: vid })
+          });
+          const parsed = await parseApiResponse(res);
+          if (!parsed.ok || !parsed.data) {
+            log("热切换音色失败: " + parsed.detail);
+          } else {
+            log(`本机变声已热切换至 ${parsed.data.voice_id} (预热 ${parsed.data.warm_ms}ms)`);
+            await refreshVoices();
+          }
+        } catch (e) {
+          log("热切换音色异常: " + e);
         }
       }
       if (ws && ws.readyState === WebSocket.OPEN) {
+        wsReadyForAudio = false;
         ws.send(JSON.stringify({ type: "set_voice", voice_id: vid }));
       }
     };
 
     // Browser WebSocket VC + TTS playback
     function playPcm16(arrayBuffer, sampleRate) {
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (!audioCtx || audioCtx.state === "closed") {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        audioCtx = new AudioCtx();
       }
-      const int16 = new Int16Array(arrayBuffer);
-      if (!int16.length) return;
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+      const usableBytes = arrayBuffer.byteLength - (arrayBuffer.byteLength % 2);
+      if (usableBytes < 2) return;
+      const int16 = new Int16Array(arrayBuffer, 0, usableBytes / 2);
       const float32 = new Float32Array(int16.length);
       for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
       const buf = audioCtx.createBuffer(1, float32.length, sampleRate);
@@ -1015,103 +1125,178 @@
     btnStart.onclick = async () => {
       const voiceId = voiceSelect.value;
       if (!voiceId) { alert("请先选择或制作一个 .a8voice 音色文件"); return; }
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/ws/vc`);
-      ws.binaryType = "arraybuffer";
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const msg = "浏览器麦克风 API 不可用：请通过 http://127.0.0.1、http://localhost 或 https:// 访问，或切换至「本机声卡」模式。";
+        log(msg);
+        metricsEl.textContent = "状态：" + msg;
+        return;
+      }
 
-      ws.onopen = async () => {
-        try {
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-          nextPlayTime = audioCtx.currentTime;
-          ws.send(JSON.stringify({ type: "config", voice_id: voiceId, input_sample_rate: audioCtx.sampleRate }));
-          micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-          const source = audioCtx.createMediaStreamSource(micStream);
-          processor = audioCtx.createScriptProcessor(2048, 1, 1);
-          processor.onaudioprocess = (ev) => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-            const input = ev.inputBuffer.getChannelData(0);
-            const pcm = new Int16Array(input.length);
-            for (let i = 0; i < input.length; i++) {
-              const s = Math.max(-1, Math.min(1, input[i]));
-              pcm[i] = s < 0 ? s * 32768 : s * 32767;
-            }
-            ws.send(pcm.buffer);
-          };
-          source.connect(processor);
-          processor.connect(audioCtx.destination);
-          btnStart.disabled = true;
-          btnStop.disabled = false;
-          btnFlush.disabled = false;
-          metricsEl.textContent = `状态：实时连接中 (音色: ${voiceId})`;
-          log(`浏览器实时变声已启动，音色: ${voiceId}`);
-        } catch (err) {
-          log("无法获取浏览器麦克风权限: " + err);
-          stopVC();
-        }
+      lastWsError = "";
+      wsReadyForAudio = false;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      btnFlush.disabled = true;
+      metricsEl.textContent = "状态：正在初始化音频与麦克风...";
+
+      try {
+        await ensureAudioContext();
+        nextPlayTime = audioCtx.currentTime;
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true }
+        });
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        processor = audioCtx.createScriptProcessor(2048, 1, 1);
+        zeroGain = audioCtx.createGain();
+        zeroGain.gain.value = 0;
+        processor.onaudioprocess = (ev) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN || !wsReadyForAudio) return;
+          const input = ev.inputBuffer.getChannelData(0);
+          const pcm = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i++) {
+            const s = Math.max(-1, Math.min(1, input[i]));
+            pcm[i] = s < 0 ? s * 32768 : s * 32767;
+          }
+          ws.send(pcm.buffer);
+        };
+        micSource.connect(processor);
+        processor.connect(zeroGain);
+        zeroGain.connect(audioCtx.destination);
+      } catch (err) {
+        const msg = "无法获取浏览器麦克风权限: " + err;
+        log(msg);
+        stopVC(msg);
+        return;
+      }
+
+      metricsEl.textContent = "状态：正在连接 WebSocket 并加载模型...";
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const socket = new WebSocket(`${proto}://${location.host}/ws/vc`);
+      socket.binaryType = "arraybuffer";
+      ws = socket;
+
+      socket.onopen = () => {
+        metricsEl.textContent = "状态：已连接，正在初始化变声引擎...";
       };
 
-      ws.onmessage = (ev) => {
+      socket.onerror = () => {
+        lastWsError = "WebSocket 连接异常，请检查后端日志";
+        log(lastWsError);
+        metricsEl.textContent = "状态：" + lastWsError;
+      };
+
+      socket.onmessage = async (ev) => {
         if (ev.data instanceof ArrayBuffer) {
           playPcm16(ev.data, outSampleRate);
           return;
         }
-        const msg = JSON.parse(ev.data);
+        if (typeof Blob !== "undefined" && ev.data instanceof Blob) {
+          playPcm16(await ev.data.arrayBuffer(), outSampleRate);
+          return;
+        }
+        let msg;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch (_err) {
+          log("收到无法解析的 WebSocket 消息");
+          return;
+        }
         if (msg.type === "ready") {
           outSampleRate = msg.output_sample_rate || 44100;
+          metricsEl.textContent = `状态：正在预热音色 (${voiceId})...`;
+          socket.send(JSON.stringify({
+            type: "config",
+            voice_id: voiceId,
+            input_sample_rate: audioCtx ? audioCtx.sampleRate : 16000
+          }));
+        } else if (msg.type === "voice_changed") {
+          wsReadyForAudio = true;
+          btnFlush.disabled = false;
+          metricsEl.textContent = `状态：实时连接中 (音色: ${msg.voice_id}, 采样率: ${audioCtx ? audioCtx.sampleRate : 16000}Hz → ${outSampleRate}Hz)`;
+          log(`浏览器实时变声已就绪，音色: ${msg.voice_id} (预热 ${msg.warm_ms}ms)`);
         } else if (msg.type === "transcript") {
           log(`[WebSocket 识别 ${msg.asr_ms}ms] "${msg.text}"`);
         } else if (msg.type === "metrics") {
           metricsEl.textContent = `ASR: ${msg.asr_ms}ms | Prefill: ${msg.prefill_ms}ms (${msg.cache_hit ? "命中缓存" : "冷启动"}) | TTFA: ${msg.ttfa_ms}ms`;
           refreshHealth();
-        } else if (msg.type === "voice_changed") {
-          log(`热切换音色成功: ${msg.voice_id} (预热 ${msg.warm_ms}ms)`);
         } else if (msg.type === "error") {
-          log(`错误: ${msg.message}`);
+          lastWsError = msg.message || "未知服务端错误";
+          log(`WebSocket 错误: ${lastWsError}`);
+          metricsEl.textContent = `错误: ${lastWsError}`;
         }
       };
 
-      ws.onclose = () => stopVC();
+      socket.onclose = (ev) => {
+        if (ws !== socket) return;
+        const reason = lastWsError || (ev.code !== 1000 && ev.code !== 1005 ? `连接关闭 (code=${ev.code})` : "");
+        stopVC(reason);
+      };
     };
 
-    function stopVC() {
-      if (processor) { processor.disconnect(); processor = null; }
+    function stopVC(reasonText = "") {
+      wsReadyForAudio = false;
+      if (processor) { try { processor.disconnect(); } catch (_e) {} processor = null; }
+      if (micSource) { try { micSource.disconnect(); } catch (_e) {} micSource = null; }
+      if (zeroGain) { try { zeroGain.disconnect(); } catch (_e) {} zeroGain = null; }
       if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-      if (ws) { ws.close(); ws = null; }
+      if (ws) {
+        const closing = ws;
+        ws = null;
+        closing.onopen = null;
+        closing.onmessage = null;
+        closing.onerror = null;
+        closing.onclose = null;
+        try { closing.close(); } catch (_e) {}
+      }
       btnStart.disabled = false;
       btnStop.disabled = true;
       btnFlush.disabled = true;
-      metricsEl.textContent = "状态：已停止";
+      metricsEl.textContent = reasonText ? `状态：已停止 (${reasonText})` : "状态：已停止";
     }
-    btnStop.onclick = stopVC;
+    btnStop.onclick = () => stopVC();
     btnFlush.onclick = () => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "flush" }));
     };
 
     document.getElementById("btn-tts").onclick = async () => {
+      const btnTts = document.getElementById("btn-tts");
       const voiceId = voiceSelect.value;
       const text = document.getElementById("tts-text").value.trim();
       if (!voiceId || !text) { alert("请先选择音色并输入文本"); return; }
-      log(`流式试听 [${voiceId}]: ${text}`);
-      const res = await fetch("/api/tts/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ voice_id: voiceId, text })
-      });
-      if (!res.ok) { log("试听失败: " + await res.text()); return; }
-      const sr = parseInt(res.headers.get("X-Sample-Rate") || "44100", 10);
-      const reader = res.body.getReader();
-      let carry = new Uint8Array(0);
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const merged = new Uint8Array(carry.length + value.length);
-        merged.set(carry, 0);
-        merged.set(value, carry.length);
-        const evenLen = merged.length - (merged.length % 2);
-        if (evenLen > 0) playPcm16(merged.slice(0, evenLen).buffer, sr);
-        carry = merged.slice(evenLen);
+      btnTts.disabled = true;
+      try {
+        await ensureAudioContext();
+        nextPlayTime = audioCtx.currentTime;
+        log(`流式试听 [${voiceId}]: ${text}`);
+        const res = await fetch("/api/tts/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice_id: voiceId, text })
+        });
+        if (!res.ok) {
+          const parsed = await parseApiResponse(res);
+          log("试听失败: " + parsed.detail);
+          return;
+        }
+        const sr = parseInt(res.headers.get("X-Sample-Rate") || "44100", 10);
+        const reader = res.body.getReader();
+        let carry = new Uint8Array(0);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const merged = new Uint8Array(carry.length + value.length);
+          merged.set(carry, 0);
+          merged.set(value, carry.length);
+          const evenLen = merged.length - (merged.length % 2);
+          if (evenLen > 0) playPcm16(merged.slice(0, evenLen).buffer, sr);
+          carry = merged.slice(evenLen);
+        }
+        refreshHealth();
+      } catch (e) {
+        log("试听异常: " + e);
+      } finally {
+        btnTts.disabled = false;
       }
-      refreshHealth();
     };
 
     document.getElementById("btn-import").onclick = async () => {
@@ -1120,23 +1305,31 @@
       const form = new FormData();
       form.append("file", file);
       form.append("overwrite", "true");
-      const res = await fetch("/api/voices/import", { method: "POST", body: form });
-      const data = await res.json();
-      if (!res.ok) { log("导入失败: " + (data.detail || res.status)); return; }
-      log(`已导入 .a8voice 音色: ${data.voice.voice_id}`);
-      await refreshVoices();
+      try {
+        const res = await fetch("/api/voices/import", { method: "POST", body: form });
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) { log("导入失败: " + parsed.detail); return; }
+        log(`已导入 .a8voice 音色: ${parsed.data.voice.voice_id}`);
+        await refreshVoices();
+      } catch (e) {
+        log("导入异常: " + e);
+      }
     };
 
     document.getElementById("enroll-form").onsubmit = async (ev) => {
       ev.preventDefault();
       const form = new FormData(ev.target);
       log("正在编码并生成 .a8voice 音色文件...");
-      const res = await fetch("/api/voices/enroll", { method: "POST", body: form });
-      const data = await res.json();
-      if (!res.ok) { log("制作失败: " + (data.detail || res.status)); return; }
-      log(`成功生成音色包: ${data.voice.voice_id} (${data.voice.num_frames} 帧)`);
-      ev.target.reset();
-      await refreshVoices();
+      try {
+        const res = await fetch("/api/voices/enroll", { method: "POST", body: form });
+        const parsed = await parseApiResponse(res);
+        if (!parsed.ok || !parsed.data) { log("制作失败: " + parsed.detail); return; }
+        log(`成功生成音色包: ${parsed.data.voice.voice_id} (${parsed.data.voice.num_frames} 帧)`);
+        ev.target.reset();
+        await refreshVoices();
+      } catch (e) {
+        log("制作异常: " + e);
+      }
     };
 
     // Initial boot

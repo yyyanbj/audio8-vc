@@ -136,13 +136,16 @@ def get_builtin_voices_dir() -> Path:
 
 
 def get_icon_path(ext: str = "ico") -> Path | None:
-    """Locate bundled application icon (`.ico` or `.png`)."""
-    filename = f"audio8_vc.{ext.lstrip('.')}"
+    """Locate bundled application icon (`.ico`, `.png`, or `.svg`)."""
+    norm_ext = ext.lstrip(".").lower()
+    filename = f"audio8_vc.{norm_ext}"
+    static_name = "favicon.ico" if norm_ext == "ico" else f"icon.{norm_ext}"
     candidates = [
         get_bundle_dir() / "assets" / filename,
+        get_static_dir() / static_name,
         get_bundle_dir() / "packaging" / "windows" / "assets" / filename,
         get_executable_dir() / "assets" / filename,
-        Path(__file__).resolve().parents[2] / "packaging" / "windows" / "assets" / filename,
+        Path(__file__).resolve().parents[3] / "packaging" / "windows" / "assets" / filename,
     ]
     for path in candidates:
         if path.is_file():

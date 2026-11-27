@@ -25,6 +25,7 @@ datas: list[tuple[str, str]] = [
     (str(SRC_DIR / "a8vc" / "voices" / "builtins"), "a8vc/voices/builtins"),
     (str(SPEC_DIR / "assets" / "audio8_vc.ico"), "assets"),
     (str(SPEC_DIR / "assets" / "audio8_vc.png"), "assets"),
+    (str(SPEC_DIR / "assets" / "audio8_vc.svg"), "assets"),
     (str(REPO_ROOT / "README.md"), "."),
 ]
 binaries: list[tuple[str, str]] = []
@@ -50,6 +51,8 @@ hiddenimports: list[str] = [
     "uvicorn.protocols.websockets",
     "uvicorn.protocols.websockets.auto",
     "uvicorn.protocols.websockets.websockets_impl",
+    "uvicorn.protocols.websockets.websockets_sansio_impl",
+    "uvicorn.protocols.websockets.wsproto_impl",
     "uvicorn.lifespan",
     "uvicorn.lifespan.on",
     "uvicorn.lifespan.off",
@@ -60,34 +63,53 @@ hiddenimports: list[str] = [
     "scipy.signal",
 ]
 
-# Collect native DLLs, data files, and submodules for runtime packages
-_COLLECT_ALL_PACKAGES = (
+# Collect native DLLs, data files, and submodules for required runtime packages
+_REQUIRED_COLLECT_ALL = (
     "onnxruntime",
     "sherpa_onnx",
+    "soundfile",
+    "tokenizers",
+)
+_OPTIONAL_COLLECT_ALL = (
     "sounddevice",
     "_sounddevice_data",
-    "soundfile",
     "_soundfile_data",
-    "tokenizers",
     "webview",
     "clr_loader",
     "pythonnet",
 )
 
-for pkg in _COLLECT_ALL_PACKAGES:
+for pkg in _REQUIRED_COLLECT_ALL:
+    pkg_datas, pkg_bins, pkg_hidden = collect_all(pkg)
+    datas += pkg_datas
+    binaries += pkg_bins
+    hiddenimports += pkg_hidden
+
+for pkg in _OPTIONAL_COLLECT_ALL:
     try:
         pkg_datas, pkg_bins, pkg_hidden = collect_all(pkg)
         datas += pkg_datas
         binaries += pkg_bins
         hiddenimports += pkg_hidden
     except Exception as exc:
-        print(f"[audio8_vc.spec] Note: skipped collect_all({pkg!r}): {exc}")
+        print(f"[audio8_vc.spec] Note: skipped optional collect_all({pkg!r}): {exc}")
 
-for pkg in ("a8vc", "uvicorn", "fastapi", "starlette", "websockets", "anyio", "huggingface_hub"):
+_REQUIRED_COLLECT_SUBMODULES = (
+    "a8vc",
+    "uvicorn",
+    "fastapi",
+    "starlette",
+    "websockets",
+    "anyio",
+)
+for pkg in _REQUIRED_COLLECT_SUBMODULES:
+    hiddenimports += collect_submodules(pkg)
+
+for pkg in ("huggingface_hub",):
     try:
         hiddenimports += collect_submodules(pkg)
     except Exception as exc:
-        print(f"[audio8_vc.spec] Note: skipped collect_submodules({pkg!r}): {exc}")
+        print(f"[audio8_vc.spec] Note: skipped optional collect_submodules({pkg!r}): {exc}")
 
 # Optional: bundle NVIDIA CUDA 12 / cuDNN 9 DLLs from `nvidia-*-cu12` wheels when requested
 if os.environ.get("A8VC_BUNDLE_CUDA_RUNTIME", "").strip().lower() in {"1", "true", "yes"}:
@@ -123,6 +145,25 @@ excludes = [
     "webview.platforms.android",
 ]
 
+# On Windows, `sherpa-onnx-core` ships its own CPU-only `onnxruntime.dll` under
+# `sherpa_onnx/lib/` and `.venv/Scripts/`. Ensure every bundled copy of `onnxruntime.dll`
+# comes from the active `onnxruntime` package (CPU / DirectML / CUDA) so GPU flavors
+# can never be shadowed by sherpa-onnx's CPU-only DLL.
+_CANONICAL_ORT_DLL: str | None = None
+if os.name == "nt":
+    try:
+        import onnxruntime as _ort_pkg
+
+        _ort_candidate = Path(_ort_pkg.__file__).resolve().parent / "capi" / "onnxruntime.dll"
+        if _ort_candidate.is_file():
+            _CANONICAL_ORT_DLL = str(_ort_candidate)
+            binaries = [
+                (_CANONICAL_ORT_DLL if Path(src).name.lower() == "onnxruntime.dll" else src, dst)
+                for src, dst in binaries
+            ]
+    except Exception as exc:
+        print(f"[audio8_vc.spec] Note: could not locate canonical onnxruntime.dll: {exc}")
+
 a_gui = Analysis(  # noqa: F821
     [str(SPEC_DIR / "entry_desktop.py")],
     pathex=[str(SRC_DIR)],
@@ -148,6 +189,17 @@ a_cli = Analysis(  # noqa: F821
     excludes=excludes,
     noarchive=False,
 )
+
+if _CANONICAL_ORT_DLL is not None:
+    for _analysis in (a_gui, a_cli):
+        _analysis.binaries = [
+            (
+                dest,
+                _CANONICAL_ORT_DLL if Path(src).name.lower() == "onnxruntime.dll" else src,
+                kind,
+            )
+            for dest, src, kind in _analysis.binaries
+        ]
 
 pyz_gui = PYZ(a_gui.pure)  # noqa: F821
 pyz_cli = PYZ(a_cli.pure)  # noqa: F821

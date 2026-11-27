@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="packaging/windows/assets/audio8_vc.svg" width="96" height="96" alt="Audio8-VC Icon" />
+</p>
+
 # Audio8-VC (`a8vc`)
 
 基于 **Edge0-AI** 开源 0.1B 轻量语音模型（[`Edge0/Audio8-TTS-Preview-0.1b`](https://huggingface.co/Edge0/Audio8-TTS-Preview-0.1b) 与官方低占用 ONNX INT8 运行时 [`Edge0/audio8-TTS-0.1B-ONNX-INT8`](https://huggingface.co/Edge0/audio8-TTS-0.1B-ONNX-INT8)）构建的**高推理效率、低资源占用、支持独立 `.a8voice` 音色文件**的实时变声器项目。
@@ -159,13 +163,17 @@ uv run a8vc desktop
 - `Audio8-VC-<version>-win64-<variant>-portable.zip`（解压即用的免安装便携版）
 - `SHA256SUMS.txt`（校验和）
 
-### 方式 2：在 Linux / macOS 下通过 GitHub Actions 云端自动构建 Windows 安装包
+### 方式 2：在 Linux / macOS 下通过 GitHub Actions 云端自动构建与 Win10/Win11 矩阵验证
 
-仓库已配置 [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)：
+仓库已配置 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 与 [`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)：
 
-- 推送版本标签（如 `git tag v0.1.0 && git push origin v0.1.0`）自动在 `windows-latest` 并行构建 **CPU + DirectML GPU (`dml`) + NVIDIA CUDA GPU (`cuda`)** 三个版本，完成单元测试、PyInstaller 打包、Inno Setup 编译、静默安装/Provider 校验/卸载烟雾测试，并将全部安装包、便携 ZIP 与合并后的 `SHA256SUMS.txt` 发布至 GitHub Releases。
-- 也可在 GitHub Actions 页面手动触发 `Build Windows Installer`（支持选择 `all` / `cpu` / `dml` / `cuda` 与是否预打包离线模型 `bundle_models`）并直接下载构建产物。
-- 运行 `a8vc info` 可随时查看当前加速后端、可用 ONNX Execution Providers 与 CUDA 运行库探测结果。
+- **发版前 Win10 / Win11 环境矩阵测试（Windows CPU）**：每次推送到 `main`、提 PR 或打 `v*` 标签发版前，均会在 **`windows-2022`（Win10 兼容基线）** 与 **`windows-2025`（Win11 24H2 兼容基线）** 两个环境并行运行：
+  1. 代码规范与防回归检查（`ruff`、`a8vc lint`、`a8vc self-check`、`pytest`）；
+  2. **安装版（`-setup.exe`）与便携版（`-portable.zip`）双形态验证**（静默安装、同目录覆盖升级 `[InstallDelete]` 清理、静默卸载、`portable.flag` 数据隔离、品牌图标与统一 `onnxruntime.dll` 校验、CP1252 编码兼容）；
+  3. **真实模型 + 无头浏览器端到端推理**：基于 `actions/cache` 缓存的真实 `Audio8-0.1B` + `SenseVoice ASR` + `Silero VAD`，自动验证 `/api/tts/stream`、`/api/voices/enroll`、48kHz `/ws/vc` 以及 **无头 Edge/Chromium 虚拟麦克风真实浏览器 `/ws/vc` 变声回放全链路**。
+- **自动构建与发版**：推送版本标签（如 `git tag v0.2.1 && git push origin v0.2.1`）自动并行构建 **CPU + DirectML GPU (`dml`) + NVIDIA CUDA GPU (`cuda`)** 三个版本，**只有当 Win10 + Win11 CPU 矩阵 E2E 全部通过后**才会将安装包、便携 ZIP 与合并后的 `SHA256SUMS.txt` 发布至 GitHub Releases。
+- 也可在 GitHub Actions 页面手动触发 `Build Windows Installer`（支持选择 `all` / `cpu` / `dml` / `cuda` 与是否预打包离线模型 `bundle_models`）或 `CI Lint & Windows CPU Matrix`。
+- 运行 `a8vc info` 可随时查看当前加速后端、可用 ONNX Execution Providers 与 CUDA 运行库探测结果；运行 `a8vc lint` / `a8vc self-check` 可在本地随时自检。
 
 ### 在 Windows 游戏 / 语音软件中接入实时变声
 

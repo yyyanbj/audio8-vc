@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import platform
 import subprocess
@@ -19,6 +20,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -54,6 +56,8 @@ from a8vc.voices.catalog import (
 )
 from a8vc.voices.enroll import VoiceEnroller
 from a8vc.voices.store import VoiceLibrary
+
+logger = logging.getLogger("a8vc.server")
 
 
 class TTSStreamRequest(BaseModel):
@@ -245,6 +249,19 @@ def create_app(
     )
     app.state.a8vc = srv_state
 
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": f"{type(exc).__name__}: {exc}",
+                "error_type": type(exc).__name__,
+            },
+        )
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         html_path = get_static_dir() / "index.html"
@@ -257,6 +274,20 @@ def create_app(
         icon = get_icon_path("ico")
         if icon is not None and icon.is_file():
             return FileResponse(str(icon), media_type="image/x-icon")
+        raise HTTPException(status_code=404, detail="Icon not found")
+
+    @app.get("/icon.svg", include_in_schema=False)
+    async def icon_svg() -> Any:
+        icon = get_icon_path("svg")
+        if icon is not None and icon.is_file():
+            return FileResponse(str(icon), media_type="image/svg+xml")
+        raise HTTPException(status_code=404, detail="Icon not found")
+
+    @app.get("/icon.png", include_in_schema=False)
+    async def icon_png() -> Any:
+        icon = get_icon_path("png")
+        if icon is not None and icon.is_file():
+            return FileResponse(str(icon), media_type="image/png")
         raise HTTPException(status_code=404, detail="Icon not found")
 
     @app.get("/api/health")
@@ -275,6 +306,16 @@ def create_app(
             if synth_loaded
             else None
         )
+        provider_note = (
+            getattr(srv_state._synthesizer, "provider_note", None)
+            if synth_loaded
+            else None
+        )
+        session_providers = (
+            getattr(srv_state._synthesizer, "session_providers", None)
+            if synth_loaded
+            else None
+        )
         return {
             "status": "ok",
             "version": __version__,
@@ -285,6 +326,8 @@ def create_app(
             "configured_provider": srv_state.cfg.runtime.provider,
             "active_provider": active_provider,
             "provider_warning": provider_warning,
+            "provider_note": provider_note,
+            "session_providers": session_providers,
             "active_voice_id": srv_state.active_voice_id,
             "voice_count": len(srv_state.library.list_voices()),
             "registration": srv_state.enroller.status(),
@@ -394,6 +437,11 @@ def create_app(
 
     @app.post("/api/live/start")
     async def live_start(req: LiveStartRequest) -> dict[str, Any]:
+        if not srv_state.library.exists(req.voice_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"音色 {req.voice_id!r} 不存在，请先选择或安装音色。",
+            )
         try:
             return await asyncio.to_thread(
                 srv_state.live_session.start,
@@ -402,11 +450,18 @@ def create_app(
                 output_device=req.output_device,
             )
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            logger.warning("live_start missing required file: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"所需模型文件缺失，请先点击「一键下载所需模型」: {exc}",
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            logger.exception("live_start failed for voice_id=%r", req.voice_id)
+            raise HTTPException(
+                status_code=500, detail=f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     @app.post("/api/live/stop")
     async def live_stop() -> dict[str, Any]:
@@ -422,6 +477,11 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("live_switch_voice failed for voice_id=%r", req.voice_id)
+            raise HTTPException(
+                status_code=500, detail=f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     @app.post("/api/live/flush")
     async def live_flush() -> dict[str, Any]:
@@ -512,6 +572,13 @@ def create_app(
                 warm_ms = await asyncio.to_thread(synth.warm_voice, pack)
             except FileNotFoundError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("set_active_voice warm failed for voice_id=%r", req.voice_id)
+                raise HTTPException(
+                    status_code=500, detail=f"{type(exc).__name__}: {exc}"
+                ) from exc
 
         srv_state.active_voice_id = pack.voice_id
         return {
@@ -579,6 +646,11 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("enroll_voice failed for voice_id=%r", voice_id)
+            raise HTTPException(
+                status_code=500, detail=f"{type(exc).__name__}: {exc}"
+            ) from exc
 
         return {
             "status": "enrolled",
@@ -601,27 +673,66 @@ def create_app(
     async def tts_stream(req: TTSStreamRequest) -> StreamingResponse:
         try:
             pack = srv_state.library.load(req.voice_id)
-            synth = srv_state.get_synthesizer()
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        try:
+            synth = await asyncio.to_thread(srv_state.get_synthesizer)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Audio8 推理模型尚未下载，请先点击「一键下载所需模型」: {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("tts_stream synthesizer init failed")
+            raise HTTPException(
+                status_code=500, detail=f"{type(exc).__name__}: {exc}"
+            ) from exc
+
         cancel = threading.Event()
+        stream_iter = synth.stream_audio(
+            req.text,
+            pack,
+            cancel_event=cancel,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            top_k=req.top_k,
+            chunk_frames=req.chunk_frames,
+        )
+
+        # Prime the first chunk before committing HTTP 200 headers so prefill/runtime errors
+        # return structured JSON errors instead of mid-stream Internal Server Error resets.
+        def _next_pcm() -> bytes | None:
+            for chunk in stream_iter:
+                if chunk.audio.size > 0:
+                    return float32_to_pcm16(chunk.audio)
+            return None
+
+        try:
+            first_pcm = await asyncio.to_thread(_next_pcm)
+        except ValueError as exc:
+            cancel.set()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            cancel.set()
+            logger.exception("tts_stream synthesis failed for voice_id=%r", req.voice_id)
+            raise HTTPException(
+                status_code=500, detail=f"{type(exc).__name__}: {exc}"
+            ) from exc
 
         def _generate() -> Any:
             try:
-                for chunk in synth.stream_audio(
-                    req.text,
-                    pack,
-                    cancel_event=cancel,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    top_k=req.top_k,
-                    chunk_frames=req.chunk_frames,
-                ):
+                if first_pcm:
+                    yield first_pcm
+                for chunk in stream_iter:
                     if chunk.audio.size > 0:
                         yield float32_to_pcm16(chunk.audio)
+            except Exception:
+                logger.exception("tts_stream mid-stream error for voice_id=%r", req.voice_id)
             finally:
                 cancel.set()
 
@@ -639,31 +750,39 @@ def create_app(
         loop = asyncio.get_running_loop()
         out_queue: asyncio.Queue[bytes | dict[str, Any] | None] = asyncio.Queue()
 
+        def _enqueue(item: bytes | dict[str, Any]) -> None:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(out_queue.put_nowait, item)
+
         try:
             engine = await asyncio.to_thread(srv_state.create_vc_engine)
         except Exception as exc:
-            await websocket.send_json({"type": "error", "message": str(exc)})
-            await websocket.close(code=1011)
+            logger.exception("WebSocket /ws/vc engine initialization failed")
+            try:
+                await websocket.send_json(
+                    {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
+                )
+                await websocket.close(code=1011)
+            except Exception:
+                pass
             return
 
         input_sr = srv_state.cfg.audio.input_sample_rate
 
         def _on_event(event: VCOutputEvent) -> None:
             if event.transcript:
-                loop.call_soon_threadsafe(
-                    out_queue.put_nowait,
+                _enqueue(
                     {
                         "type": "transcript",
                         "text": event.transcript,
                         "voice_id": event.voice_id,
                         "asr_ms": event.asr_ms,
-                    },
+                    }
                 )
             if event.audio.size > 0:
-                loop.call_soon_threadsafe(out_queue.put_nowait, float32_to_pcm16(event.audio))
+                _enqueue(float32_to_pcm16(event.audio))
             if event.is_final:
-                loop.call_soon_threadsafe(
-                    out_queue.put_nowait,
+                _enqueue(
                     {
                         "type": "metrics",
                         "voice_id": event.voice_id,
@@ -672,13 +791,17 @@ def create_app(
                         "ttfa_ms": event.ttfa_ms,
                         "cache_hit": event.cache_hit,
                         "dropped_segments": worker.dropped_segments,
-                    },
+                    }
                 )
+
+        def _on_error(exc: Exception) -> None:
+            _enqueue({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
 
         worker = RealtimeVCWorker(
             engine,
             _on_event,
             max_pending_segments=srv_state.cfg.engine.max_pending_segments,
+            on_error=_on_error,
         )
         worker.start()
 
@@ -687,23 +810,25 @@ def create_app(
                 item = await out_queue.get()
                 if item is None:
                     break
-                if isinstance(item, bytes):
-                    await websocket.send_bytes(item)
-                else:
-                    await websocket.send_json(item)
+                try:
+                    if isinstance(item, bytes):
+                        await websocket.send_bytes(item)
+                    else:
+                        await websocket.send_json(item)
+                except Exception:
+                    break
 
         sender_task = asyncio.create_task(_sender())
-        await websocket.send_json(
-            {
-                "type": "ready",
-                "mode": engine.mode,
-                "input_sample_rate": input_sr,
-                "output_sample_rate": engine.output_sample_rate,
-                "voice_id": engine.active_voice.voice_id if engine.active_voice else None,
-            }
-        )
-
         try:
+            await websocket.send_json(
+                {
+                    "type": "ready",
+                    "mode": engine.mode,
+                    "input_sample_rate": input_sr,
+                    "output_sample_rate": engine.output_sample_rate,
+                    "voice_id": engine.active_voice.voice_id if engine.active_voice else None,
+                }
+            )
             while True:
                 message = await websocket.receive()
                 msg_type = message.get("type")
@@ -719,8 +844,14 @@ def create_app(
                             }
                         )
                         continue
-                    audio_f32 = pcm16_to_float32(raw_bytes)
-                    worker.submit_audio(audio_f32, input_sr)
+                    try:
+                        audio_f32 = pcm16_to_float32(raw_bytes)
+                        worker.submit_audio(audio_f32, input_sr)
+                    except Exception as exc:
+                        logger.exception("WebSocket /ws/vc audio submission failed")
+                        await websocket.send_json(
+                            {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
+                        )
                     continue
 
                 raw_text = message.get("text")
@@ -735,7 +866,13 @@ def create_app(
                 action = cmd.get("type")
                 if action in {"config", "set_voice"}:
                     if "input_sample_rate" in cmd:
-                        input_sr = max(8000, min(48000, int(cmd["input_sample_rate"])))
+                        try:
+                            input_sr = max(8000, min(192000, int(cmd["input_sample_rate"])))
+                        except (TypeError, ValueError):
+                            await websocket.send_json(
+                                {"type": "error", "message": "Invalid input_sample_rate"}
+                            )
+                            continue
                     vid = cmd.get("voice_id")
                     if vid:
                         try:
@@ -751,9 +888,18 @@ def create_app(
                                 }
                             )
                         except Exception as exc:
-                            await websocket.send_json({"type": "error", "message": str(exc)})
+                            logger.exception("WebSocket /ws/vc set_voice failed for %r", vid)
+                            await websocket.send_json(
+                                {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
+                            )
                 elif action == "flush":
-                    worker.flush()
+                    try:
+                        worker.flush()
+                    except Exception as exc:
+                        logger.exception("WebSocket /ws/vc flush failed")
+                        await websocket.send_json(
+                            {"type": "error", "message": f"{type(exc).__name__}: {exc}"}
+                        )
                 elif action == "cancel":
                     engine.cancel()
                     engine.reset()
@@ -762,6 +908,8 @@ def create_app(
                     await websocket.send_json({"type": "pong", "stats": engine.stats()})
         except WebSocketDisconnect:
             pass
+        except Exception:
+            logger.exception("WebSocket /ws/vc unexpected error")
         finally:
             worker.stop()
             await out_queue.put(None)

@@ -201,6 +201,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dl_p.add_argument("--hf-endpoint", default="", help="Custom Hugging Face endpoint URL")
 
+    # --- self-check ---
+    sc_p = sub.add_parser(
+        "self-check",
+        help="Run offline runtime & packaging verification (ORT, sherpa-onnx, VAD, WebSocket, voices)",
+    )
+    sc_p.add_argument("--json", action="store_true", dest="as_json", help="Output JSON report")
+
+    # --- lint ---
+    lint_p = sub.add_parser(
+        "lint",
+        help="Run extensible Audio8-VC repository lint suite (CI, packaging, ABI, runtime, API, WebUI)",
+    )
+    lint_p.add_argument("--root", type=str, default=None, help="Repository root directory")
+    lint_p.add_argument("--select", type=str, default="", help="Comma-separated rule IDs/prefixes")
+    lint_p.add_argument("--ignore", type=str, default="", help="Comma-separated rule IDs/prefixes")
+    lint_p.add_argument("--category", type=str, default="", help="Comma-separated categories")
+    lint_p.add_argument("--list-rules", action="store_true", help="List all lint rules and exit")
+    lint_p.add_argument("--strict", action="store_true", help="Treat warnings as errors")
+    lint_p.add_argument("--json", action="store_true", dest="as_json", help="Output JSON report")
+
     return parser
 
 
@@ -593,12 +613,38 @@ def _cmd_info(args: argparse.Namespace, cfg: AppConfig) -> int:
     return 0
 
 
+def _cmd_self_check(args: argparse.Namespace, cfg: AppConfig) -> int:
+    from a8vc.selfcheck import run_self_check
+
+    report = run_self_check(cfg)
+    if args.as_json:
+        _print_json(report)
+        return 0 if report["ok"] else 1
+
+    print(
+        f"Audio8-VC self-check: {report['passed']}/{report['total']} passed "
+        f"({'OK' if report['ok'] else 'FAILED'})"
+    )
+    for item in report["checks"]:
+        mark = "PASS" if item["ok"] else "FAIL"
+        print(f"  [{mark}] {item['name']} ({item['elapsed_ms']:.1f}ms): {item['detail']}")
+    return 0 if report["ok"] else 1
+
+
+def _cmd_lint(args: argparse.Namespace) -> int:
+    from a8vc.lint.runner import run_lint_cli
+
+    return run_lint_cli(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "desktop":
         return _cmd_desktop(args)
+    if args.command == "lint":
+        return _cmd_lint(args)
 
     cfg = load_config(args.config)
 
@@ -608,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_devices()
     if args.command == "info":
         return _cmd_info(args, cfg)
+    if args.command == "self-check":
+        return _cmd_self_check(args, cfg)
     if args.command == "synth":
         return _cmd_synth(args, cfg)
     if args.command == "benchmark":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -16,6 +17,8 @@ from a8vc.audio.vad import SpeechSegment, SpeechSegmenter
 from a8vc.engine.base import VCOutputEvent, VoiceConversionEngine
 from a8vc.runtime.audio8_onnx import SynthesizerBackend
 from a8vc.voices.format import VoicePack
+
+logger = logging.getLogger("a8vc.engine.cascaded")
 
 
 def get_process_rss_mb() -> float:
@@ -229,14 +232,38 @@ class RealtimeVCWorker:
         on_event: Callable[[VCOutputEvent], None],
         *,
         max_pending_segments: int = 2,
+        on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self.engine = engine
         self._on_event = on_event
+        self._on_error = on_error
         self._max_pending = max(1, int(max_pending_segments))
         self._queue: queue.Queue[SpeechSegment | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._dropped_segments = 0
+        self._error_count = 0
+        self._last_error = ""
+        self._last_error_ts = 0.0
+        self._error_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+
+    def _report_error(self, exc: Exception, *, context: str) -> None:
+        msg = f"{type(exc).__name__}: {exc}"
+        now = time.monotonic()
+        should_notify = False
+        with self._error_lock:
+            self._error_count += 1
+            if msg != self._last_error or (now - self._last_error_ts) >= 3.0:
+                self._last_error = msg
+                self._last_error_ts = now
+                should_notify = True
+        if should_notify:
+            logger.exception("RealtimeVCWorker error during %s: %s", context, msg)
+            if self._on_error is not None:
+                try:
+                    self._on_error(exc)
+                except Exception:
+                    logger.debug("on_error callback raised", exc_info=True)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -250,18 +277,24 @@ class RealtimeVCWorker:
         self._thread.start()
 
     def submit_audio(self, audio: np.ndarray, sample_rate: int) -> None:
-        mono = ensure_mono_float32(audio)
-        if mono.size == 0:
-            return
-        if sample_rate != self.engine._segmenter.sample_rate:
-            mono = resample_audio(mono, sample_rate, self.engine._segmenter.sample_rate)
-        for seg in self.engine._segmenter.feed(mono):
-            self._enqueue_segment(seg)
+        try:
+            mono = ensure_mono_float32(audio)
+            if mono.size == 0:
+                return
+            if sample_rate != self.engine._segmenter.sample_rate:
+                mono = resample_audio(mono, sample_rate, self.engine._segmenter.sample_rate)
+            for seg in self.engine._segmenter.feed(mono):
+                self._enqueue_segment(seg)
+        except Exception as exc:
+            self._report_error(exc, context="submit_audio")
 
     def flush(self) -> None:
-        seg = self.engine._segmenter.flush()
-        if seg is not None:
-            self._enqueue_segment(seg)
+        try:
+            seg = self.engine._segmenter.flush()
+            if seg is not None:
+                self._enqueue_segment(seg)
+        except Exception as exc:
+            self._report_error(exc, context="flush")
 
     def _enqueue_segment(self, seg: SpeechSegment) -> None:
         while self._queue.qsize() >= self._max_pending:
@@ -286,13 +319,23 @@ class RealtimeVCWorker:
                     if self._stop_event.is_set():
                         break
                     self._on_event(event)
-            except Exception:
-                # Keep worker resilient during transient live audio/runtime errors
+            except Exception as exc:
+                self._report_error(exc, context="convert_segment")
                 continue
 
     @property
     def dropped_segments(self) -> int:
         return self._dropped_segments
+
+    @property
+    def error_count(self) -> int:
+        with self._error_lock:
+            return self._error_count
+
+    @property
+    def last_error(self) -> str:
+        with self._error_lock:
+            return self._last_error
 
     def stop(self) -> None:
         self._stop_event.set()

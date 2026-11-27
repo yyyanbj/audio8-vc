@@ -4,14 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audio8-vc"
-version = "0.2.0"
+version = "0.2.1"
 description = "Low-footprint real-time voice changer built on Edge0-AI Audio8-TTS-0.1B with portable .a8voice packs"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = { text = "Apache-2.0" }
 dependencies = [
   "numpy>=1.24,<3",
-  "onnxruntime>=1.22,<1.24",
+  # Pinned to exact ABI match with sherpa-onnx==1.13.0 (bundles onnxruntime.dll 1.24.4)
+  # and Windows DirectML/CUDA wheels (onnxruntime-directml==1.24.4 / onnxruntime-gpu==1.24.4).
+  "onnxruntime==1.24.4",
   "tokenizers>=0.20,<0.23",
   "soundfile>=0.12,<1",
   "scipy>=1.10,<2",
@@ -19,7 +21,6 @@ dependencies = [
   "uvicorn[standard]>=0.29,<1",
   "pydantic>=2.6,<3",
   "python-multipart>=0.0.9,<1",
-  "tomli>=2.0.1,<3; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +28,12 @@ audio = [
   "sounddevice>=0.4.6,<1",
 ]
 asr = [
-  "sherpa-onnx>=1.10,<2",
+  # Explicitly pin both sherpa-onnx and sherpa-onnx-core at 1.13.0:
+  # 1) sherpa-onnx 1.13.x marks `Dynamic: requires-dist`, which causes uv's universal
+  #    resolver to omit transitive sherpa-onnx-core unless explicitly declared.
+  # 2) sherpa-onnx-core==1.13.0 embeds onnxruntime 1.24.4 (ABI-matched with onnxruntime==1.24.4).
+  "sherpa-onnx==1.13.0",
+  "sherpa-onnx-core==1.13.0",
 ]
 download = [
   "huggingface_hub>=0.24,<1",
@@ -73,7 +79,7 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

@@ -55,6 +55,15 @@ class SherpaOnnxASR:
         num_threads: int = 2,
         provider: str = "cpu",
     ) -> None:
+        # On Windows, DLL loading is process-global by basename (`onnxruntime.dll`).
+        # Always load `onnxruntime` before `sherpa_onnx` so the flavor-matched
+        # `onnxruntime/capi/onnxruntime.dll` (CPU / DirectML / CUDA) wins over
+        # `sherpa_onnx/lib/onnxruntime.dll`.
+        try:
+            import onnxruntime as _ort  # noqa: F401
+        except ImportError:
+            pass
+
         try:
             import sherpa_onnx
         except ImportError as exc:

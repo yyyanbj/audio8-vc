@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       providers: ${{ steps.matrix.outputs.providers }}
+      has_cpu: ${{ steps.matrix.outputs.has_cpu }}
     steps:
       - name: Determine provider matrix
         id: matrix
@@ -38,13 +39,47 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.provider }}" != "all" ]]; then
             echo 'providers=["${{ inputs.provider }}"]' >> "$GITHUB_OUTPUT"
+            if [[ "${{ inputs.provider }}" == "cpu" ]]; then
+              echo "has_cpu=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_cpu=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo 'providers=["cpu","dml","cuda"]' >> "$GITHUB_OUTPUT"
+            echo "has_cpu=true" >> "$GITHUB_OUTPUT"
           fi
+
+  lint-and-test:
+    name: Lint, Self-Check & Unit Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync dependencies (all + dev)
+        run: uv sync --extra all --extra dev
+
+      - name: Run ruff lint
+        run: uv run ruff check .
+
+      - name: Run Audio8-VC project lint suite
+        run: uv run a8vc lint
+
+      - name: Run Audio8-VC runtime self-check
+        run: uv run a8vc self-check
+
+      - name: Run pytest suite
+        run: uv run pytest -v
 
   build-windows:
     name: Windows x64 (${{ matrix.provider }})
-    needs: prepare
+    needs: [prepare, lint-and-test]
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -66,10 +101,13 @@ jobs:
         shell: pwsh
         run: choco install innosetup --no-progress -y
 
-      - name: Run unit test suite
+      - name: Run lint, self-check, and unit test suite
         shell: pwsh
         run: |
-          uv sync --extra dev
+          uv sync --extra windows --extra dev
+          uv run ruff check .
+          uv run a8vc lint
+          uv run a8vc self-check
           uv run pytest -v
 
       - name: Build Audio8-VC Windows installer & portable ZIP (${{ matrix.provider }})
@@ -115,8 +153,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Installed a8vc.exe info --json failed with code $LASTEXITCODE"
           }
+          Write-Host $infoRaw
           $info = ($infoRaw -join "`n") | ConvertFrom-Json
-          Write-Host "Installed info: configured=$($info.configured_provider), asr=$($info.asr_provider), flavor=$($info.ort_flavor), providers=[$($info.available_providers -join ', ')]"
           if ($info.configured_provider -ne $provider) {
             throw "Installed configured_provider mismatch: expected '$provider', got '$($info.configured_provider)'"
           }
@@ -128,6 +166,10 @@ jobs:
           }
           if ($provider -eq "cuda" -and ($info.available_providers -notcontains "CUDAExecutionProvider")) {
             throw "Installed CUDA build missing CUDAExecutionProvider"
+          }
+          & $cli self-check
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed a8vc.exe self-check failed with code $LASTEXITCODE"
           }
           & $cli voice list
           if ($LASTEXITCODE -ne 0) {
@@ -165,9 +207,60 @@ jobs:
             dist/release/*-portable.zip
           if-no-files-found: error
 
+  verify-windows-cpu-matrix:
+    name: Verify Windows CPU Matrix (${{ matrix.label }})
+    needs: [prepare, build-windows]
+    if: needs.prepare.outputs.has_cpu == 'true'
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            label: Win10 baseline (Server 2022)
+          - os: windows-2025
+            label: Win11 24H2 baseline (Server 2025)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync lightweight E2E runner dependencies
+        shell: pwsh
+        run: uv sync --extra download --extra dev
+
+      - name: Download built Windows CPU artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Audio8-VC-windows-x64-cpu
+          path: artifacts_cpu
+
+      - name: Cache Audio8-0.1B + SenseVoice ASR + Silero VAD models
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/a8vc-models-cache
+          key: a8vc-models-v1-audio8-sensevoice-silero
+
+      - name: Run full installer + portable + real-model + headless browser E2E
+        shell: pwsh
+        run: |
+          $verifyParams = @{
+            ArtifactDir    = (Join-Path $PWD "artifacts_cpu")
+            ModelsCacheDir = (Join-Path $env:RUNNER_TEMP "a8vc-models-cache")
+            Provider       = "cpu"
+            OrtVersion     = "1.24.4"
+          }
+          & .\packaging\windows\verify_windows_e2e.ps1 @verifyParams
+
   release:
     name: Publish GitHub Release (CPU + DirectML GPU + CUDA GPU)
-    needs: build-windows
+    needs: [build-windows, verify-windows-cpu-matrix]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

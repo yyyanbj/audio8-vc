@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 
 from a8vc.config import VADConfig
+
+logger = logging.getLogger("a8vc.audio.vad")
 
 
 class VADBackend(Protocol):
@@ -57,74 +60,158 @@ class EnergyVAD:
         return float(np.clip(prob, 0.0, 1.0))
 
 
+def _resolve_tensor_shape(raw_shape: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Resolve static/dynamic ONNX shape metadata into concrete positive integer dims."""
+    if not isinstance(raw_shape, (list, tuple)) or len(raw_shape) != len(default):
+        return default
+    resolved: list[int] = []
+    for dim, fallback in zip(raw_shape, default, strict=True):
+        if isinstance(dim, int) and dim > 0:
+            resolved.append(dim)
+        else:
+            resolved.append(fallback)
+    return tuple(resolved)
+
+
 class SileroVADOnnx:
-    """Optional Silero VAD ONNX backend (~2 MB, supports v4 and v5 exports)."""
+    """Optional Silero VAD ONNX backend (~0.6-2 MB).
+
+    Dynamically adapts to all common 16 kHz Silero VAD ONNX exports:
+    - sherpa-onnx export: inputs ``['x', 'h', 'c']`` -> outputs ``['prob', 'new_h', 'new_c']``
+    - Official Silero v5: inputs ``['input', 'state', 'sr'?]`` -> outputs ``['output', 'stateN']``
+    - Official Silero v4: inputs ``['input', 'sr', 'h', 'c']`` -> outputs ``['output', 'hn', 'cn']``
+    """
 
     frame_samples: int = 512
 
-    def __init__(self, model_path: str | Path, sample_rate: int = 16000) -> None:
-        import onnxruntime as ort
-
-        path = Path(model_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Silero VAD model not found: {path}")
+    def __init__(
+        self,
+        model_path: str | Path,
+        sample_rate: int = 16000,
+        *,
+        session: Any = None,
+    ) -> None:
         if sample_rate != 16000:
             raise ValueError("SileroVADOnnx currently expects 16000 Hz input")
 
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-        opts.log_severity_level = 3
-        self._session = ort.InferenceSession(
-            str(path),
-            sess_options=opts,
-            providers=["CPUExecutionProvider"],
-        )
-        self._input_names = [inp.name for inp in self._session.get_inputs()]
-        self._is_v5 = "state" in self._input_names
+        if session is not None:
+            self._session = session
+        else:
+            import onnxruntime as ort
+
+            path = Path(model_path)
+            if not path.is_file():
+                raise FileNotFoundError(f"Silero VAD model not found: {path}")
+
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 1
+            opts.inter_op_num_threads = 1
+            opts.log_severity_level = 3
+            self._session = ort.InferenceSession(
+                str(path),
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+
+        inputs = {inp.name: inp for inp in self._session.get_inputs()}
+        self._input_names = list(inputs.keys())
+        self._has_sr = "sr" in inputs
         self._sr = np.array(sample_rate, dtype=np.int64)
-        self._context = np.zeros(64, dtype=np.float32)
+
+        if "x" in inputs:
+            self._audio_input_name = "x"
+        elif "input" in inputs:
+            self._audio_input_name = "input"
+        else:
+            raise ValueError(
+                f"Unsupported Silero VAD ONNX audio input signature: {self._input_names}"
+            )
+
+        if "state" in inputs:
+            self._schema = "v5"
+            self._state_shape = _resolve_tensor_shape(inputs["state"].shape, (2, 1, 128))
+            audio_shape = inputs[self._audio_input_name].shape
+            fixed_len = audio_shape[-1] if isinstance(audio_shape, (list, tuple)) and audio_shape else None
+            # Official v5 accepts 576 samples (64-sample context + 512 frame) or dynamic length
+            self._context_samples = 0 if (isinstance(fixed_len, int) and fixed_len == self.frame_samples) else 64
+        elif "h" in inputs and "c" in inputs:
+            self._schema = "hc"
+            self._h_shape = _resolve_tensor_shape(inputs["h"].shape, (2, 1, 64))
+            self._c_shape = _resolve_tensor_shape(inputs["c"].shape, (2, 1, 64))
+            self._context_samples = 0
+        else:
+            raise ValueError(
+                f"Unsupported Silero VAD ONNX state signature: {self._input_names}"
+            )
+
+        self._context = np.zeros(self._context_samples, dtype=np.float32)
+        self.reset()
+        # Self-verify tensor feed contract on a silent frame immediately at load time
+        _ = self.probability(np.zeros(self.frame_samples, dtype=np.float32))
         self.reset()
 
+    @property
+    def schema(self) -> str:
+        """Detected ONNX graph variant ('hc' for sherpa/v4 or 'v5')."""
+        return self._schema
+
     def reset(self) -> None:
-        self._context = np.zeros(64, dtype=np.float32)
-        if self._is_v5:
-            self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(self._context_samples, dtype=np.float32)
+        if self._schema == "v5":
+            self._state = np.zeros(self._state_shape, dtype=np.float32)
         else:
-            self._h = np.zeros((2, 1, 64), dtype=np.float32)
-            self._c = np.zeros((2, 1, 64), dtype=np.float32)
+            self._h = np.zeros(self._h_shape, dtype=np.float32)
+            self._c = np.zeros(self._c_shape, dtype=np.float32)
 
     def probability(self, frame: np.ndarray) -> float:
-        x = np.asarray(frame, dtype=np.float32)
+        x = np.asarray(frame, dtype=np.float32).reshape(-1)
         if x.size != self.frame_samples:
             if x.size < self.frame_samples:
                 x = np.pad(x, (0, self.frame_samples - x.size))
             else:
                 x = x[: self.frame_samples]
-        if self._is_v5:
-            model_in = np.concatenate([self._context, x])[None, :]
-            self._context = x[-64:].copy()
-            out, self._state = self._session.run(
-                None,
-                {"input": model_in, "state": self._state, "sr": self._sr},
-            )
-            return float(out.reshape(-1)[0])
-        else:
-            out, self._h, self._c = self._session.run(
-                None,
-                {"input": x[None, :], "sr": self._sr, "h": self._h, "c": self._c},
-            )
-            return float(out.reshape(-1)[0])
+        if self._schema == "v5":
+            if self._context_samples > 0:
+                model_in = np.concatenate([self._context, x])[None, :]
+                self._context = x[-self._context_samples :].copy()
+            else:
+                model_in = x[None, :]
+            feed: dict[str, np.ndarray] = {
+                self._audio_input_name: model_in,
+                "state": self._state,
+            }
+            if self._has_sr:
+                feed["sr"] = self._sr
+            out, self._state = self._session.run(None, feed)
+            return float(np.clip(np.asarray(out).reshape(-1)[0], 0.0, 1.0))
+
+        feed = {
+            self._audio_input_name: x[None, :],
+            "h": self._h,
+            "c": self._c,
+        }
+        if self._has_sr:
+            feed["sr"] = self._sr
+        out, self._h, self._c = self._session.run(None, feed)
+        return float(np.clip(np.asarray(out).reshape(-1)[0], 0.0, 1.0))
 
 
-def create_vad(cfg: VADConfig, vad_model_path: Path | None = None) -> VADBackend:
+def create_vad(cfg: VADConfig, vad_model_path: str | Path | None = None) -> VADBackend:
     """Create a VAD backend according to configuration."""
+    resolved_path = Path(vad_model_path) if vad_model_path is not None else None
     if cfg.backend == "silero":
-        if vad_model_path is None:
+        if resolved_path is None:
             raise ValueError("vad_model_path is required when vad.backend='silero'")
-        return SileroVADOnnx(vad_model_path)
-    if cfg.backend == "auto" and vad_model_path is not None and vad_model_path.is_file():
-        return SileroVADOnnx(vad_model_path)
+        return SileroVADOnnx(resolved_path)
+    if cfg.backend == "auto" and resolved_path is not None and resolved_path.is_file():
+        try:
+            return SileroVADOnnx(resolved_path)
+        except Exception as exc:
+            logger.warning(
+                "Silero VAD failed to initialize from %s (%s); falling back to EnergyVAD",
+                resolved_path,
+                exc,
+            )
     return EnergyVAD(threshold_db=cfg.energy_threshold_db)
 
 

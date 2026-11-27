@@ -24,7 +24,7 @@ from typing import Any
 
 from a8vc import __version__
 from a8vc.config import AppConfig, load_config
-from a8vc.paths import get_logs_dir, is_frozen
+from a8vc.paths import get_icon_path, get_logs_dir, is_frozen
 from a8vc.server.app import ServerState, create_app
 from a8vc.voices.format import A8VOICE_EXT
 
@@ -214,14 +214,21 @@ def launch_desktop(
                     text_select=True,
                 )
                 launched_webview = True
+                start_kwargs: dict[str, Any] = {}
+                icon_file = get_icon_path("png") or get_icon_path("ico")
+                if icon_file is not None:
+                    import inspect
+
+                    if "icon" in inspect.signature(webview.start).parameters:
+                        start_kwargs["icon"] = str(icon_file)
                 if sys.platform == "win32":
                     try:
-                        webview.start(gui="edgechromium")
+                        webview.start(gui="edgechromium", **start_kwargs)
                     except Exception as exc:
                         logger.warning("WebView2 (edgechromium) start failed, retrying default: %s", exc)
-                        webview.start()
+                        webview.start(**start_kwargs)
                 else:
-                    webview.start()
+                    webview.start(**start_kwargs)
             except Exception as exc:
                 logger.warning("pywebview unavailable or failed (%s); falling back to browser", exc)
                 launched_webview = False

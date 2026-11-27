@@ -119,10 +119,17 @@ class LocalLiveSessionManager:
                             self._last_metrics = metrics
                         self._record_event("metrics", metrics)
 
+                def _on_error(exc: Exception) -> None:
+                    msg = f"{type(exc).__name__}: {exc}"
+                    with self._lock:
+                        self._last_error = msg
+                    self._record_event("error", {"message": msg})
+
                 worker = RealtimeVCWorker(
                     engine,
                     _on_event,
                     max_pending_segments=self._cfg.engine.max_pending_segments,
+                    on_error=_on_error,
                 )
                 bridge = self._bridge_factory(
                     on_input_chunk=worker.submit_audio,

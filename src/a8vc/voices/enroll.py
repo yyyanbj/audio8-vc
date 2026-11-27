@@ -109,7 +109,7 @@ class VoiceEnroller:
 
         session = None
         try:
-            session, _, _ = create_onnx_session(
+            session, active_ep, _ = create_onnx_session(
                 encoder_path,
                 provider=self.provider,
                 threads=self.threads,
@@ -119,7 +119,18 @@ class VoiceEnroller:
                 feed = tensor.astype(np.float16, copy=False)
             else:
                 feed = tensor.astype(np.float32, copy=False)
-            outputs = session.run(None, {inp.name: feed})
+            try:
+                outputs = session.run(None, {inp.name: feed})
+            except Exception:
+                if active_ep == "CPUExecutionProvider":
+                    raise
+                del session
+                session, _, _ = create_onnx_session(
+                    encoder_path,
+                    provider="cpu",
+                    threads=self.threads,
+                )
+                outputs = session.run(None, {inp.name: feed})
             codes = np.asarray(outputs[0])
             if codes.ndim == 3:
                 codes = codes[0]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -16,9 +17,15 @@ from a8vc.config import RuntimeConfig
 from a8vc.runtime.manifest import RuntimeManifest, load_runtime_manifest
 from a8vc.runtime.prefix_cache import PrefixStateCache, PrefixStateSnapshot
 from a8vc.runtime.prompt import PromptBuilder
-from a8vc.runtime.providers import create_onnx_session, resolve_providers
+from a8vc.runtime.providers import (
+    create_onnx_session,
+    resolve_providers,
+    select_model_provider,
+)
 from a8vc.runtime.sampling import sample_codebook, sample_semantic
 from a8vc.voices.format import VoicePack
+
+logger = logging.getLogger("a8vc.runtime.audio8_onnx")
 
 _SLOW_INPUTS = {"codes", "position", "cache_keys", "cache_values", "conv_states", "ssm_states"}
 _SLOW_OUTPUTS = {"logits", "hidden", "key_delta", "value_delta", "next_conv_states", "next_ssm_states"}
@@ -132,30 +139,54 @@ class Audio8OnnxRuntime:
             threads = max(1, min(8, cpu_count // 2))
         self.threads = threads
 
+        slow_req, slow_note = select_model_provider(
+            self.cfg.provider,
+            model_role="slow_ar",
+            precision=self.cfg.precision,
+        )
         self._slow, slow_ep, slow_warn = create_onnx_session(
             self.manifest.slow_model_path,
-            provider=self.cfg.provider,
+            provider=slow_req,
             threads=threads,
         )
-        # If slow_ar already fell back to CPU, avoid redundant GPU error noise on fast/decoder
-        effective_req = "cpu" if (slow_warn is not None and slow_ep == "CPUExecutionProvider") else self.cfg.provider
+
+        fast_req, fast_note = select_model_provider(
+            self.cfg.provider,
+            model_role="fast_ar",
+            precision=self.cfg.precision,
+        )
+        # If slow_ar attempted GPU and failed, avoid repeating identical GPU init failure on fast_ar
+        if slow_warn is not None and slow_ep == "CPUExecutionProvider":
+            fast_req = "cpu"
         self._fast, fast_ep, fast_warn = create_onnx_session(
             self.manifest.fast_model_path,
-            provider=effective_req,
+            provider=fast_req,
             threads=threads,
         )
+
+        dec_req, _ = select_model_provider(
+            self.cfg.provider,
+            model_role="codec_decoder",
+            precision=self.cfg.codec_precision,
+        )
+        if slow_warn is not None and slow_ep == "CPUExecutionProvider" and slow_note is None:
+            dec_req = "cpu"
         self._decoder, dec_ep, dec_warn = create_onnx_session(
             self.manifest.codec_decoder_path,
-            provider=effective_req,
+            provider=dec_req,
             threads=threads,
         )
-        self.active_provider: str = slow_ep
+
         self.session_providers: dict[str, str] = {
             "slow_ar": slow_ep,
             "fast_ar": fast_ep,
             "codec_decoder": dec_ep,
         }
+        self.active_provider: str = self._compute_active_provider()
+        self.provider_note: str | None = slow_note or fast_note
         self.provider_warning: str | None = slow_warn or fast_warn or dec_warn
+        if self.provider_note:
+            logger.info("%s", self.provider_note)
         self._tokenizer = Tokenizer.from_file(str(self.manifest.tokenizer_path))
 
         self.prompt_builder = PromptBuilder(
@@ -257,6 +288,41 @@ class Audio8OnnxRuntime:
             )
         return caches
 
+    def _compute_active_provider(self) -> str:
+        for role in ("slow_ar", "codec_decoder", "fast_ar"):
+            ep = self.session_providers.get(role, "CPUExecutionProvider")
+            if ep != "CPUExecutionProvider":
+                return ep
+        return "CPUExecutionProvider"
+
+    def _fallback_session_to_cpu(self, role: str, exc: Exception) -> None:
+        """Rebuild a failing GPU ONNX session on CPU so runtime kernel errors never crash synthesis."""
+        prev_ep = self.session_providers.get(role, "CPUExecutionProvider")
+        path_map = {
+            "slow_ar": self.manifest.slow_model_path,
+            "fast_ar": self.manifest.fast_model_path,
+            "codec_decoder": self.manifest.codec_decoder_path,
+        }
+        attr_map = {
+            "slow_ar": "_slow",
+            "fast_ar": "_fast",
+            "codec_decoder": "_decoder",
+        }
+        model_path = path_map[role]
+        msg = (
+            f"{role} 在 {prev_ep} 推理阶段执行失败，已自动回退到 CPUExecutionProvider: {exc}"
+        )
+        logger.warning("%s", msg)
+        cpu_sess, _, _ = create_onnx_session(
+            model_path,
+            provider="cpu",
+            threads=self.threads,
+        )
+        setattr(self, attr_map[role], cpu_sess)
+        self.session_providers[role] = "CPUExecutionProvider"
+        self.active_provider = self._compute_active_provider()
+        self.provider_warning = msg
+
     def _slow_step(
         self,
         column: np.ndarray,
@@ -272,9 +338,17 @@ class Audio8OnnxRuntime:
             "conv_states": state["conv_states"],
             "ssm_states": state["ssm_states"],
         }
-        logits, hidden, key_delta, value_delta, next_conv, next_ssm = self._slow.run(
-            self._slow_output_names, feed
-        )
+        try:
+            logits, hidden, key_delta, value_delta, next_conv, next_ssm = self._slow.run(
+                self._slow_output_names, feed
+            )
+        except Exception as exc:
+            if self.session_providers.get("slow_ar") == "CPUExecutionProvider":
+                raise
+            self._fallback_session_to_cpu("slow_ar", exc)
+            logits, hidden, key_delta, value_delta, next_conv, next_ssm = self._slow.run(
+                self._slow_output_names, feed
+            )
         state["cache_keys"][:, :, :, position, :] = key_delta[:, :, :, 0, :] if key_delta.ndim == 5 else key_delta
         state["cache_values"][:, :, :, position, :] = value_delta[:, :, :, 0, :] if value_delta.ndim == 5 else value_delta
         np.copyto(state["conv_states"], next_conv)
@@ -296,7 +370,13 @@ class Audio8OnnxRuntime:
             "input_pos": np.array([input_pos], dtype=self._fast_dtypes["input_pos"]),
         }
         feed.update(fast_caches)
-        outputs = self._fast.run(self._fast_output_names, feed)
+        try:
+            outputs = self._fast.run(self._fast_output_names, feed)
+        except Exception as exc:
+            if self.session_providers.get("fast_ar") == "CPUExecutionProvider":
+                raise
+            self._fallback_session_to_cpu("fast_ar", exc)
+            outputs = self._fast.run(self._fast_output_names, feed)
         logits = outputs[0][0, -1]
 
         out_idx = 1
@@ -352,7 +432,14 @@ class Audio8OnnxRuntime:
             raise ValueError(
                 f"Expected codes shape [1, {self.manifest.num_codebooks}, T], got {arr.shape}"
             )
-        audio = self._decoder.run(None, {self._decoder_input_name: np.ascontiguousarray(arr)})[0]
+        feed = {self._decoder_input_name: np.ascontiguousarray(arr)}
+        try:
+            audio = self._decoder.run(None, feed)[0]
+        except Exception as exc:
+            if self.session_providers.get("codec_decoder") == "CPUExecutionProvider":
+                raise
+            self._fallback_session_to_cpu("codec_decoder", exc)
+            audio = self._decoder.run(None, feed)[0]
         return np.ascontiguousarray(np.asarray(audio, dtype=np.float32).reshape(-1))
 
     def stream_audio(

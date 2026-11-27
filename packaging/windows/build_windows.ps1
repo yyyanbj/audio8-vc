@@ -78,27 +78,29 @@ try {
     Write-Host "Version   : $Version"
 
     # 2. Ensure Python / uv environment is ready
+    # Exact ONNX Runtime ABI version matching sherpa-onnx==1.13.0 (embeds onnxruntime.dll 1.24.4)
+    $OrtVersion = "1.24.4"
     $hasUv = $null -ne (Get-Command uv -ErrorAction SilentlyContinue)
     if ($hasUv) {
         Write-Host "`n[1/6] Syncing dependencies with uv (--extra windows --extra build)..." -ForegroundColor Green
         Invoke-Checked "uv" @("sync", "--extra", "windows", "--extra", "build")
         $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
         if ($Provider -eq "dml") {
-            Write-Host "Installing onnxruntime-directml for DirectML GPU acceleration..." -ForegroundColor Yellow
+            Write-Host "Installing onnxruntime-directml==$OrtVersion for DirectML GPU acceleration..." -ForegroundColor Yellow
             Invoke-Checked "uv" @("pip", "uninstall", "--python", $VenvPython, "onnxruntime")
-            Invoke-Checked "uv" @("pip", "install", "--python", $VenvPython, "onnxruntime-directml>=1.20,<1.24")
+            Invoke-Checked "uv" @("pip", "install", "--python", $VenvPython, "onnxruntime-directml==$OrtVersion")
         } elseif ($Provider -eq "cuda") {
-            Write-Host "Installing onnxruntime-gpu for NVIDIA CUDA acceleration..." -ForegroundColor Yellow
+            Write-Host "Installing onnxruntime-gpu==$OrtVersion for NVIDIA CUDA acceleration..." -ForegroundColor Yellow
             Invoke-Checked "uv" @("pip", "uninstall", "--python", $VenvPython, "onnxruntime")
             if ($BundleCudaRuntime) {
                 Write-Host "Installing optional NVIDIA CUDA 12 + cuDNN 9 runtime wheels..." -ForegroundColor Yellow
                 Invoke-Checked "uv" @(
                     "pip", "install", "--python", $VenvPython,
-                    "onnxruntime-gpu[cuda,cudnn]>=1.22,<1.24",
+                    "onnxruntime-gpu[cuda,cudnn]==$OrtVersion",
                     "nvidia-cublas-cu12<12.9.3"
                 )
             } else {
-                Invoke-Checked "uv" @("pip", "install", "--python", $VenvPython, "onnxruntime-gpu>=1.22,<1.24")
+                Invoke-Checked "uv" @("pip", "install", "--python", $VenvPython, "onnxruntime-gpu==$OrtVersion")
             }
         }
         $PyRun = @("uv", "run", "--no-sync")
@@ -108,17 +110,17 @@ try {
         Invoke-Checked "python" @("-m", "pip", "install", "-e", ".[windows,build]")
         if ($Provider -eq "dml") {
             Invoke-Checked "python" @("-m", "pip", "uninstall", "-y", "onnxruntime")
-            Invoke-Checked "python" @("-m", "pip", "install", "onnxruntime-directml>=1.20,<1.24")
+            Invoke-Checked "python" @("-m", "pip", "install", "onnxruntime-directml==$OrtVersion")
         } elseif ($Provider -eq "cuda") {
             Invoke-Checked "python" @("-m", "pip", "uninstall", "-y", "onnxruntime")
             if ($BundleCudaRuntime) {
                 Invoke-Checked "python" @(
                     "-m", "pip", "install",
-                    "onnxruntime-gpu[cuda,cudnn]>=1.22,<1.24",
+                    "onnxruntime-gpu[cuda,cudnn]==$OrtVersion",
                     "nvidia-cublas-cu12<12.9.3"
                 )
             } else {
-                Invoke-Checked "python" @("-m", "pip", "install", "onnxruntime-gpu>=1.22,<1.24")
+                Invoke-Checked "python" @("-m", "pip", "install", "onnxruntime-gpu==$OrtVersion")
             }
         }
         $PyRun = @()
@@ -244,12 +246,16 @@ try {
     if ($info.asr_provider -ne "cpu") {
         throw "Expected asr_provider='cpu', got '$($info.asr_provider)'"
     }
+    if ($info.ort_version -ne $OrtVersion) {
+        throw "Expected ort_version='$OrtVersion' (ABI-matched with sherpa-onnx), got '$($info.ort_version)'"
+    }
     if ($Provider -eq "dml" -and ($info.available_providers -notcontains "DmlExecutionProvider")) {
         throw "DirectML build is missing DmlExecutionProvider! Available: $($info.available_providers -join ', ')"
     }
     if ($Provider -eq "cuda" -and ($info.available_providers -notcontains "CUDAExecutionProvider")) {
         throw "CUDA build is missing CUDAExecutionProvider! Available: $($info.available_providers -join ', ')"
     }
+    Invoke-Checked $BuiltCli @("self-check")
 
     $Artifacts = @()
 

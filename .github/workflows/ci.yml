@@ -1,0 +1,160 @@
+name: CI Lint & Windows CPU Matrix
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Lint, Self-Check & Unit Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync dependencies (all + dev)
+        run: uv sync --extra all --extra dev
+
+      - name: Run ruff lint
+        run: uv run ruff check .
+
+      - name: Run Audio8-VC project lint suite
+        run: uv run a8vc lint
+
+      - name: Run Audio8-VC runtime self-check
+        run: uv run a8vc self-check
+
+      - name: Run pytest suite
+        run: uv run pytest -v
+
+  windows-unit-matrix:
+    name: Windows Unit & Self-Check (${{ matrix.label }})
+    needs: lint-and-test
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            label: Win10 baseline (Server 2022)
+          - os: windows-2025
+            label: Win11 24H2 baseline (Server 2025)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Run ruff, project lint, self-check & pytest
+        shell: pwsh
+        run: |
+          uv sync --extra windows --extra dev
+          uv run ruff check .
+          uv run a8vc lint
+          uv run a8vc self-check
+          uv run pytest -v
+
+  build-windows-cpu:
+    name: Build Windows x64 CPU Package
+    needs: lint-and-test
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows CPU installer & portable ZIP
+        shell: pwsh
+        run: |
+          $params = @{
+            Provider = "cpu"
+          }
+          & .\packaging\windows\build_windows.ps1 @params
+
+      - name: Upload Windows CPU package for matrix E2E
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audio8-VC-ci-windows-x64-cpu
+          path: |
+            dist/release/*-win64-cpu-setup.exe
+            dist/release/*-win64-cpu-portable.zip
+          retention-days: 3
+          if-no-files-found: error
+
+  verify-windows-cpu-matrix:
+    name: Windows CPU E2E Matrix (${{ matrix.label }})
+    needs: [windows-unit-matrix, build-windows-cpu]
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            label: Win10 baseline (Server 2022)
+          - os: windows-2025
+            label: Win11 24H2 baseline (Server 2025)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync lightweight E2E runner dependencies
+        shell: pwsh
+        run: uv sync --extra download --extra dev
+
+      - name: Download built Windows CPU artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Audio8-VC-ci-windows-x64-cpu
+          path: artifacts_cpu
+
+      - name: Cache Audio8-0.1B + SenseVoice ASR + Silero VAD models
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/a8vc-models-cache
+          key: a8vc-models-v1-audio8-sensevoice-silero
+
+      - name: Run full installer + portable + real-model + headless browser E2E
+        shell: pwsh
+        run: |
+          $verifyParams = @{
+            ArtifactDir    = (Join-Path $PWD "artifacts_cpu")
+            ModelsCacheDir = (Join-Path $env:RUNNER_TEMP "a8vc-models-cache")
+            Provider       = "cpu"
+            OrtVersion     = "1.24.4"
+          }
+          & .\packaging\windows\verify_windows_e2e.ps1 @verifyParams

@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="12%" y1="8%" x2="88%" y2="92%">
+      <stop offset="0%" stop-color="#111a33"/>
+      <stop offset="52%" stop-color="#182246"/>
+      <stop offset="100%" stop-color="#261746"/>
+    </linearGradient>
+    <radialGradient id="cyanGlow" cx="26%" cy="24%" r="58%">
+      <stop offset="0%" stop-color="#38e8ff" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#38e8ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="violetGlow" cx="76%" cy="78%" r="58%">
+      <stop offset="0%" stop-color="#e056fd" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#e056fd" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rimGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8ae8ff" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#6b8cff" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#f08cff" stop-opacity="0.45"/>
+    </linearGradient>
+    <linearGradient id="eightGrad" x1="18%" y1="12%" x2="84%" y2="88%">
+      <stop offset="0%" stop-color="#4df5ff"/>
+      <stop offset="46%" stop-color="#5c8dff"/>
+      <stop offset="100%" stop-color="#ee6bff"/>
+    </linearGradient>
+    <linearGradient id="leftWaveGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#88fbff"/>
+      <stop offset="100%" stop-color="#36c2ff"/>
+    </linearGradient>
+    <linearGradient id="rightWaveGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f794ff"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#050814" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded Studio Tile -->
+  <rect x="14" y="14" width="228" height="228" rx="54" fill="url(#bgGrad)"/>
+  <rect x="14" y="14" width="228" height="228" rx="54" fill="url(#cyanGlow)"/>
+  <rect x="14" y="14" width="228" height="228" rx="54" fill="url(#violetGlow)"/>
+  <rect x="16.5" y="16.5" width="223" height="223" rx="51.5" fill="none" stroke="url(#rimGrad)" stroke-width="3"/>
+
+  <!-- Voice-Morph Emblem: Left input waveform -> Central Audio8 "8" -> Right output waveform -->
+  <g filter="url(#softShadow)">
+    <!-- Left input soundwave bars (cyan) -->
+    <rect x="37" y="110" width="13" height="36" rx="6.5" fill="url(#leftWaveGrad)" opacity="0.88"/>
+    <rect x="57" y="92" width="14" height="72" rx="7" fill="url(#leftWaveGrad)"/>
+
+    <!-- Right morphed soundwave bars (violet-magenta) -->
+    <rect x="185" y="92" width="14" height="72" rx="7" fill="url(#rightWaveGrad)"/>
+    <rect x="206" y="110" width="13" height="36" rx="6.5" fill="url(#rightWaveGrad)" opacity="0.88"/>
+
+    <!-- Sculpted Geometric "8" (dual acoustic rings) -->
+    <path
+      fill-rule="evenodd"
+      fill="url(#eightGrad)"
+      d="M 128 54
+         A 37 37 0 1 0 128 128
+         A 37 37 0 1 0 128 54 Z
+         M 128 73.5
+         A 17.5 17.5 0 1 1 128 108.5
+         A 17.5 17.5 0 1 1 128 73.5 Z"
+    />
+    <path
+      fill-rule="evenodd"
+      fill="url(#eightGrad)"
+      d="M 128 117
+         A 43 43 0 1 0 128 203
+         A 43 43 0 1 0 128 117 Z
+         M 128 138
+         A 22 22 0 1 1 128 182
+         A 22 22 0 1 1 128 138 Z"
+    />
+    <!-- Luminous acoustic nexus dot inside upper & lower chambers -->
+    <circle cx="128" cy="91" r="6" fill="#d8fbff" opacity="0.92"/>
+    <circle cx="128" cy="160" r="7.5" fill="#ffd9ff" opacity="0.92"/>
+  </g>
+</svg>

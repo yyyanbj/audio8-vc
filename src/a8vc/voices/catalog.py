@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -173,7 +173,7 @@ def _write_seed_marker(marker: Path, *, seeded_ids: list[str]) -> None:
         marker.write_text(
             json.dumps(
                 {
-                    "seeded_at": datetime.now(timezone.utc).isoformat(),
+                    "seeded_at": datetime.now(UTC).isoformat(),
                     "seeded_ids": seeded_ids,
                 },
                 ensure_ascii=False,

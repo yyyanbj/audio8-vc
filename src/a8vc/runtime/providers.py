@@ -33,6 +33,41 @@ _AUTO_GPU_PRIORITY = (
     "DmlExecutionProvider",
 )
 
+# Audio8 INT8 autoregressive graphs contain DynamicQuantizeLinear / MatMulInteger /
+# ScatterND ops that are unstable or crash (80070057) on DirectML while FP16 codec
+# conv/attention graphs accelerate cleanly on DirectML GPU.
+_DML_UNSAFE_INT8_ROLES = frozenset({"slow_ar", "fast_ar"})
+
+
+def select_model_provider(
+    configured_provider: str,
+    *,
+    model_role: str,
+    precision: str = "",
+    available: Iterable[str] | None = None,
+) -> tuple[str, str | None]:
+    """Select a safe effective provider string for a specific ONNX model role.
+
+    Returns ``(effective_provider, note_or_none)``.
+    """
+    normalized = (configured_provider or "cpu").strip().lower()
+    if normalized == "cpu":
+        return "cpu", None
+
+    resolved = resolve_providers(normalized, available)
+    primary = resolved[0] if resolved else "CPUExecutionProvider"
+    if (
+        primary == "DmlExecutionProvider"
+        and model_role in _DML_UNSAFE_INT8_ROLES
+        and precision.strip().lower() == "int8"
+    ):
+        note = (
+            "DirectML 对动态 INT8 自回归算子 (DynamicQuantizeLinear/MatMulInteger) 兼容性有限，"
+            "Slow/Fast AR 已自动使用 CPU 执行，Codec 解码器/编码器继续使用 DirectML GPU 加速。"
+        )
+        return "cpu", note
+    return normalized, None
+
 
 def _version_sort_key(path: Path) -> tuple[int, ...]:
     """Extract numeric version segments from directory names like `v12.6` or `v9.8`."""

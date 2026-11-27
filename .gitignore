@@ -15,6 +15,7 @@ venv/
 # Model weights, voice libraries, and generated audio
 models/
 voices/*.a8voice
+voices/.builtins_seeded
 outputs/
 *.wav
 *.flac
