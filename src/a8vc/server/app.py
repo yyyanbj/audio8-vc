@@ -322,6 +322,7 @@ def create_app(
         runtime_plan = (
             {
                 "ar_threads": getattr(srv_state._synthesizer, "ar_threads", None),
+                "fast_threads": getattr(srv_state._synthesizer, "fast_threads", None),
                 "codec_threads": getattr(srv_state._synthesizer, "codec_threads", None),
                 "pipeline_decode": srv_state.cfg.runtime.pipeline_decode,
                 "first_chunk_frames": srv_state.cfg.runtime.first_chunk_frames,
@@ -725,6 +726,15 @@ def create_app(
             stream_kwargs["first_chunk_frames"] = req.first_chunk_frames
         stream_iter = synth.stream_audio(req.text, pack, **stream_kwargs)
 
+        def _close_stream() -> None:
+            cancel.set()
+            close_fn = getattr(stream_iter, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    logger.debug("tts_stream iterator close raised", exc_info=True)
+
         # Prime the first chunk before committing HTTP 200 headers so prefill/runtime errors
         # return structured JSON errors instead of mid-stream Internal Server Error resets.
         def _next_pcm() -> bytes | None:
@@ -736,10 +746,10 @@ def create_app(
         try:
             first_pcm = await asyncio.to_thread(_next_pcm)
         except ValueError as exc:
-            cancel.set()
+            await asyncio.to_thread(_close_stream)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            cancel.set()
+            await asyncio.to_thread(_close_stream)
             logger.exception("tts_stream synthesis failed for voice_id=%r", req.voice_id)
             raise HTTPException(
                 status_code=500, detail=f"{type(exc).__name__}: {exc}"
@@ -755,7 +765,7 @@ def create_app(
             except Exception:
                 logger.exception("tts_stream mid-stream error for voice_id=%r", req.voice_id)
             finally:
-                cancel.set()
+                _close_stream()
 
         headers = {
             "X-Sample-Rate": str(synth.sample_rate),

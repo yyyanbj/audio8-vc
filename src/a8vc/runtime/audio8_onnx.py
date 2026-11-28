@@ -193,6 +193,10 @@ class Audio8OnnxRuntime:
             codec_on_gpu=codec_expected_gpu,
             pipeline_decode=self.cfg.pipeline_decode,
         )
+        # Fast-AR executes tiny 1-token acoustic codebook steps strictly sequentially
+        # inside the AR worker. Running it with 1 thread and allow_spinning=False avoids
+        # spawning an idle busy-spinning thread pool that starves Slow-AR and Codec.
+        self.fast_threads = 1
 
         self._slow, slow_ep, slow_warn = create_onnx_session(
             self.manifest.slow_model_path,
@@ -208,9 +212,9 @@ class Audio8OnnxRuntime:
         self._fast, fast_ep, fast_warn = create_onnx_session(
             self.manifest.fast_model_path,
             provider=fast_req,
-            threads=self.ar_threads,
+            threads=self.fast_threads,
             inter_op_threads=1,
-            allow_spinning=True,
+            allow_spinning=False,
         )
 
         if slow_warn is not None and slow_ep == "CPUExecutionProvider" and slow_note is None:
@@ -525,7 +529,15 @@ class Audio8OnnxRuntime:
             "fast_ar": "_fast",
             "codec_decoder": "_decoder",
         }
-        role_threads = self.codec_threads if role == "codec_decoder" else self.ar_threads
+        if role == "codec_decoder":
+            role_threads = self.codec_threads
+            role_spin = True
+        elif role == "fast_ar":
+            role_threads = self.fast_threads
+            role_spin = False
+        else:
+            role_threads = self.ar_threads
+            role_spin = True
         model_path = path_map[role]
         msg = (
             f"{role} 在 {prev_ep} 推理阶段执行失败，已自动回退到 CPUExecutionProvider: {exc}"
@@ -536,7 +548,7 @@ class Audio8OnnxRuntime:
             provider="cpu",
             threads=role_threads,
             inter_op_threads=1,
-            allow_spinning=True,
+            allow_spinning=role_spin,
         )
         setattr(self, attr_map[role], cpu_sess)
         self.session_providers[role] = "CPUExecutionProvider"

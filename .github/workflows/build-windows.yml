@@ -279,8 +279,18 @@ jobs:
             ModelsCacheDir = (Join-Path $env:RUNNER_TEMP "a8vc-models-cache")
             Provider       = "cpu"
             OrtVersion     = "1.24.4"
+            LogDir         = (Join-Path $PWD "e2e_logs")
           }
           & .\packaging\windows\verify_windows_e2e.ps1 @verifyParams
+
+      - name: Upload Windows E2E failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs-${{ matrix.os }}
+          path: e2e_logs
+          if-no-files-found: ignore
+          retention-days: 5
 
   release:
     name: Publish GitHub Release (CPU + DirectML GPU + CUDA GPU)

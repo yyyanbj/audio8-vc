@@ -23,7 +23,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ModelsCacheDir,
     [string]$Provider = "cpu",
     [string]$OrtVersion = "1.24.4",
-    [string]$WorkRoot = ""
+    [string]$WorkRoot = "",
+    [string]$LogDir = ""
 )
 
 Set-StrictMode -Version Latest
@@ -190,6 +191,7 @@ function Remove-SafeJunction {
 
 $JunctionsToClean = New-Object System.Collections.Generic.List[string]
 $CreatedWorkRoot = $false
+$CurrentStep = "Init"
 
 try {
     $osCaption = (Get-CimInstance Win32_OperatingSystem).Caption
@@ -223,6 +225,7 @@ try {
     $ResolvedModelsCache = (Resolve-Path $ModelsCacheDir).Path
 
     # 1. Ensure real Audio8-0.1B + registration + SenseVoice ASR + Silero VAD exist in cache
+    $CurrentStep = "Step 1/4: Models Cache"
     $a8Manifest = Join-Path $ResolvedModelsCache "audio8-tts-0.1b-onnx-int8\runtime_manifest.json"
     $regEncoder = Join-Path $ResolvedModelsCache "audio8-tts-0.1b-onnx-int8\registration\codec_encoder_fp16.onnx"
     $vadFile = Join-Path $ResolvedModelsCache "vad\silero_vad.onnx"
@@ -245,6 +248,7 @@ try {
     }
 
     # 2. Inno Setup Installer silent install + full real-model & headless browser E2E
+    $CurrentStep = "Step 2/4: Installer E2E"
     Write-Host "`n[Step 2/4] Verifying Inno Setup Installer ($($SetupExe.Name))..." -ForegroundColor Green
     $InstallDir = Join-Path $WorkRoot "installed_app"
     $InstallDataDir = Join-Path $WorkRoot "installed_data"
@@ -283,6 +287,7 @@ try {
     )
 
     # 3. Verify in-place upgrade ([InstallDelete] cleans _internal) & silent uninstall
+    $CurrentStep = "Step 3/4: Upgrade & Uninstall"
     Write-Host "`n[Step 3/4] Verifying in-place upgrade ([InstallDelete]) and silent uninstall..." -ForegroundColor Green
     $StaleSentinel = Join-Path $InstallDir "_internal\__stale_upgrade_sentinel__.dll"
     [System.IO.File]::WriteAllText($StaleSentinel, "stale-dll-placeholder")
@@ -317,6 +322,7 @@ try {
     Write-Host "  Verified silent uninstallation cleanly removed installed binaries." -ForegroundColor Cyan
 
     # 4. Portable ZIP isolated mode + real-model & headless browser E2E
+    $CurrentStep = "Step 4/4: Portable ZIP E2E"
     Write-Host "`n[Step 4/4] Verifying Portable ZIP ($($PortableZip.Name))..." -ForegroundColor Green
     $PortableExtract = Join-Path $WorkRoot "portable_extract"
     Expand-Archive -Path $PortableZip.FullName -DestinationPath $PortableExtract -Force
@@ -377,6 +383,34 @@ try {
     Write-Host "  Verified portable mode isolated data in .\data\voices ($($PortableVoices.Count) .a8voice files)." -ForegroundColor Cyan
 
     Write-Host "`n=== Windows E2E Matrix Verification PASSED ($osCaption) ===" -ForegroundColor Green
+}
+catch {
+    $errMsg = $_.Exception.Message
+    if (-not [string]::IsNullOrWhiteSpace($LogDir) -and $WorkRoot -and (Test-Path $WorkRoot)) {
+        try {
+            New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+            $logPatterns = @("*.json", "*.log", "e2e_failure.txt")
+            foreach ($pat in $logPatterns) {
+                Get-ChildItem -Path $WorkRoot -Recurse -Filter $pat -File -ErrorAction SilentlyContinue | ForEach-Object {
+                    $rel = $_.FullName.Substring($WorkRoot.Length).TrimStart('\', '/') -replace '[\\/]+', '__'
+                    Copy-Item -Path $_.FullName -Destination (Join-Path $LogDir $rel) -Force -ErrorAction SilentlyContinue
+                }
+            }
+            [System.IO.File]::WriteAllText(
+                (Join-Path $LogDir "verify_error.txt"),
+                "Step: $CurrentStep`nError: $errMsg`n",
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        } catch {
+            Write-Warning "Failed to collect E2E diagnostics into ${LogDir}: $_"
+        }
+    }
+    if ($env:GITHUB_ACTIONS -eq "true") {
+        $oneLine = ($errMsg -replace "[\r\n]+", " ").Trim()
+        if ($oneLine.Length -gt 800) { $oneLine = $oneLine.Substring(0, 800) }
+        Write-Host "::error title=Windows E2E Matrix Failed ($CurrentStep)::$oneLine"
+    }
+    throw
 }
 finally {
     foreach ($j in $JunctionsToClean) {

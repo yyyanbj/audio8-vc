@@ -573,7 +573,10 @@ def test_stream_audio_pipelined_matches_serial_and_guard_crossfade(
 
             return _Tok()
 
-    def _fake_create_sess(path: Path, **_kwargs: Any) -> tuple[Any, str, None]:
+    create_calls: dict[str, dict[str, Any]] = {}
+
+    def _fake_create_sess(path: Path, **kwargs: Any) -> tuple[Any, str, None]:
+        create_calls[path.name] = dict(kwargs)
         if path.name == "slow.onnx":
             return _FakeSlow(), "CPUExecutionProvider", None
         if path.name == "fast.onnx":
@@ -604,6 +607,11 @@ def test_stream_audio_pipelined_matches_serial_and_guard_crossfade(
             pipeline_decode=True,
         ),
     )
+    # Fast-AR must not spawn a busy-spinning thread pool that starves Slow-AR and Codec
+    assert create_calls["fast.onnx"]["threads"] == 1
+    assert create_calls["fast.onnx"]["allow_spinning"] is False
+    assert create_calls["slow.onnx"]["allow_spinning"] is True
+    assert create_calls["dec.onnx"]["allow_spinning"] is True
     rt_serial = audio8_onnx.Audio8OnnxRuntime(
         tmp_path,
         RuntimeConfig(
@@ -632,6 +640,73 @@ def test_stream_audio_pipelined_matches_serial_and_guard_crossfade(
     assert np.array_equal(wav2, pipe_wav)
     rt_pipe.close()
     rt_serial.close()
+
+
+def test_tts_stream_closes_iterator_on_error_and_completion(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from a8vc.config import AppConfig
+    from a8vc.runtime.audio8_onnx import StreamAudioChunk
+    from a8vc.server.app import ServerState, create_app
+
+    cfg = AppConfig()
+    cfg.paths.voices_dir = tmp_path / "voices"
+    pack = build_voice_pack(
+        voice_id="close_test",
+        codes=np.zeros((10, 4), dtype=np.int64),
+        reference_text="hi",
+        name="Close Test",
+        language="en",
+    )
+    state = ServerState(cfg)
+    state.library.save(pack, overwrite=True)
+
+    closed_events: list[str] = []
+
+    class _FakeSynth:
+        sample_rate = 44100
+        active_provider = "CPUExecutionProvider"
+        provider_warning = None
+        provider_note = None
+        session_providers = {"slow_ar": "CPUExecutionProvider"}
+        ar_threads = 2
+        fast_threads = 1
+        codec_threads = 2
+
+        def stream_audio(self, text: str, _pack: Any, **_kwargs: Any) -> Any:
+            def _gen() -> Any:
+                try:
+                    if text == "boom":
+                        raise ValueError("bad prompt")
+                    yield StreamAudioChunk(
+                        audio=np.full(512, 0.1, dtype=np.float32),
+                        sample_rate=44100,
+                        frames_generated=4,
+                        ttfa_ms=10.0,
+                        prefill_ms=5.0,
+                        cache_hit=True,
+                        is_final=True,
+                    )
+                finally:
+                    closed_events.append(text)
+
+            return _gen()
+
+        def close(self) -> None:
+            return None
+
+    state._synthesizer = _FakeSynth()  # type: ignore[assignment]
+    app = create_app(cfg, state=state)
+    client = TestClient(app)
+
+    r_ok = client.post("/api/tts/stream", json={"voice_id": "close_test", "text": "ok"})
+    assert r_ok.status_code == 200
+    assert len(r_ok.content) == 512 * 2
+
+    r_err = client.post("/api/tts/stream", json={"voice_id": "close_test", "text": "boom"})
+    assert r_err.status_code == 400
+    assert closed_events == ["ok", "boom"]
+
 
 
 

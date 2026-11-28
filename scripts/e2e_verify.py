@@ -1203,15 +1203,27 @@ def main(argv: list[str] | None = None) -> int:
         print("\n=== Audio8-VC E2E Verification PASSED ===")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
-    except Exception:
+    except Exception as exc:
         if server_log_fh is not None:
             try:
                 server_log_fh.flush()
             except Exception:
                 pass
+        server_tail = ""
         if server_log_path.is_file():
-            tail = server_log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
-            print("\n--- Server Log Tail ---\n" + tail, file=sys.stderr)
+            server_tail = server_log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            print("\n--- Server Log Tail ---\n" + server_tail, file=sys.stderr)
+        err_summary = f"{type(exc).__name__}: {exc}"
+        try:
+            (work_dir / "e2e_failure.txt").write_text(
+                err_summary + "\n\n--- Server Log Tail ---\n" + server_tail,
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+            one_line = " ".join(err_summary.split())[:800]
+            print(f"::error title=Audio8-VC E2E Failure::{one_line}", flush=True)
         raise
     finally:
         if server_proc is not None:
