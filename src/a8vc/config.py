@@ -28,12 +28,16 @@ class PathsConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     provider: Literal["cpu", "cuda", "coreml", "dml", "auto"] = "cpu"
     threads: int = Field(default=0, ge=0)
+    ar_threads: int = Field(default=0, ge=0)
+    codec_threads: int = Field(default=0, ge=0)
     precision: str = "int8"
     codec_precision: str = "fp16"
-    prefix_cache_size: int = Field(default=2, ge=0, le=32)
-    chunk_frames: int = Field(default=10, ge=2, le=64)
-    stream_context_frames: int = Field(default=96, ge=16, le=256)
+    prefix_cache_size: int = Field(default=4, ge=0, le=32)
+    first_chunk_frames: int = Field(default=4, ge=2, le=32)
+    chunk_frames: int = Field(default=8, ge=2, le=64)
+    stream_context_frames: int = Field(default=8, ge=4, le=256)
     stream_guard_frames: int = Field(default=1, ge=0, le=8)
+    pipeline_decode: bool = True
     temperature: float = Field(default=0.7, gt=0.0, le=2.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
     top_k: int = Field(default=50, ge=1, le=4096)
@@ -43,20 +47,20 @@ class RuntimeConfig(BaseModel):
 class AudioConfig(BaseModel):
     input_sample_rate: int = Field(default=16000, ge=8000, le=48000)
     output_sample_rate: int = Field(default=44100, ge=16000, le=48000)
-    input_block_ms: int = Field(default=20, ge=10, le=100)
+    input_block_ms: int = Field(default=16, ge=10, le=100)
     input_device: str | int = ""
     output_device: str | int = ""
-    crossfade_ms: int = Field(default=12, ge=0, le=100)
+    crossfade_ms: int = Field(default=6, ge=0, le=100)
 
 
 class VADConfig(BaseModel):
     backend: Literal["auto", "energy", "silero"] = "auto"
     energy_threshold_db: float = -38.0
-    speech_start_ms: int = Field(default=80, ge=32, le=1000)
-    min_silence_ms: int = Field(default=360, ge=100, le=3000)
-    pre_speech_ms: int = Field(default=160, ge=0, le=1000)
-    min_segment_ms: int = Field(default=250, ge=64, le=2000)
-    max_segment_ms: int = Field(default=4500, ge=1000, le=20000)
+    speech_start_ms: int = Field(default=64, ge=32, le=1000)
+    min_silence_ms: int = Field(default=192, ge=96, le=3000)
+    pre_speech_ms: int = Field(default=128, ge=0, le=1000)
+    min_segment_ms: int = Field(default=192, ge=64, le=2000)
+    max_segment_ms: int = Field(default=2600, ge=1000, le=20000)
 
 
 class ASRConfig(BaseModel):
@@ -69,7 +73,7 @@ class ASRConfig(BaseModel):
 
 class EngineConfig(BaseModel):
     mode: Literal["cascaded", "codec_s2s"] = "cascaded"
-    max_pending_segments: int = Field(default=2, ge=1, le=16)
+    max_pending_segments: int = Field(default=1, ge=1, le=16)
 
 
 class ServerConfig(BaseModel):
@@ -108,6 +112,12 @@ def _env_overrides() -> dict[str, Any]:
         "A8VC_VAD_MODEL_PATH": ("paths", "vad_model_path"),
         "A8VC_PROVIDER": ("runtime", "provider"),
         "A8VC_THREADS": ("runtime", "threads"),
+        "A8VC_AR_THREADS": ("runtime", "ar_threads"),
+        "A8VC_CODEC_THREADS": ("runtime", "codec_threads"),
+        "A8VC_FIRST_CHUNK_FRAMES": ("runtime", "first_chunk_frames"),
+        "A8VC_CHUNK_FRAMES": ("runtime", "chunk_frames"),
+        "A8VC_STREAM_CONTEXT_FRAMES": ("runtime", "stream_context_frames"),
+        "A8VC_PIPELINE_DECODE": ("runtime", "pipeline_decode"),
         "A8VC_ASR_BACKEND": ("asr", "backend"),
         "A8VC_ENGINE_MODE": ("engine", "mode"),
         "A8VC_HOST": ("server", "host"),

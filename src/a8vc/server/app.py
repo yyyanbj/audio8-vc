@@ -68,6 +68,7 @@ class TTSStreamRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=4096)
     max_new_tokens: int | None = Field(default=None, ge=16, le=2048)
     chunk_frames: int | None = Field(default=None, ge=2, le=64)
+    first_chunk_frames: int | None = Field(default=None, ge=2, le=32)
     seed: int | None = None
 
 
@@ -318,6 +319,20 @@ def create_app(
             if synth_loaded
             else None
         )
+        runtime_plan = (
+            {
+                "ar_threads": getattr(srv_state._synthesizer, "ar_threads", None),
+                "codec_threads": getattr(srv_state._synthesizer, "codec_threads", None),
+                "pipeline_decode": srv_state.cfg.runtime.pipeline_decode,
+                "first_chunk_frames": srv_state.cfg.runtime.first_chunk_frames,
+                "chunk_frames": srv_state.cfg.runtime.chunk_frames,
+                "stream_context_frames": srv_state.cfg.runtime.stream_context_frames,
+                "iobinding_slow": getattr(srv_state._synthesizer, "_slow_iobs", None) is not None,
+                "iobinding_fast": getattr(srv_state._synthesizer, "_fast_iob", None) is not None,
+            }
+            if synth_loaded
+            else None
+        )
         return {
             "status": "ok",
             "version": __version__,
@@ -330,6 +345,7 @@ def create_app(
             "provider_warning": provider_warning,
             "provider_note": provider_note,
             "session_providers": session_providers,
+            "runtime_plan": runtime_plan,
             "active_voice_id": srv_state.active_voice_id,
             "voice_count": len(srv_state.library.list_voices()),
             "registration": srv_state.enroller.status(),
@@ -696,17 +712,18 @@ def create_app(
             ) from exc
 
         cancel = threading.Event()
-        stream_iter = synth.stream_audio(
-            req.text,
-            pack,
-            cancel_event=cancel,
-            temperature=req.temperature,
-            top_p=req.top_p,
-            top_k=req.top_k,
-            max_new_tokens=req.max_new_tokens,
-            chunk_frames=req.chunk_frames,
-            seed=req.seed,
-        )
+        stream_kwargs: dict[str, Any] = {
+            "cancel_event": cancel,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "top_k": req.top_k,
+            "max_new_tokens": req.max_new_tokens,
+            "chunk_frames": req.chunk_frames,
+            "seed": req.seed,
+        }
+        if req.first_chunk_frames is not None:
+            stream_kwargs["first_chunk_frames"] = req.first_chunk_frames
+        stream_iter = synth.stream_audio(req.text, pack, **stream_kwargs)
 
         # Prime the first chunk before committing HTTP 200 headers so prefill/runtime errors
         # return structured JSON errors instead of mid-stream Internal Server Error resets.

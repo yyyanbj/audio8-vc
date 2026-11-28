@@ -63,6 +63,37 @@ def test_prompt_split_equals_full_prompt() -> None:
     # Text positions in user suffix have zeroed acoustic codebooks
     assert np.all(usr_suffix[0, 1:, :] == 0)
 
+    # Extended prefix cache: `<|im_start|>user\n` is cached inside system_prefix, NOT user_suffix
+    decoded_sys = bytes(int(x) - 100 for x in sys_prefix[0, 0, ref_start + 12 :]).decode("utf-8")
+    decoded_usr = bytes(int(x) - 100 for x in usr_suffix[0, 0, :]).decode("utf-8")
+    assert decoded_sys.endswith("<|im_start|>user\n")
+    assert decoded_usr.startswith("你好，世界！")
+
+
+def test_argpartition_sampling_matches_exact_topk_topp_support() -> None:
+    rng_logits = np.random.default_rng(1234)
+    logits = rng_logits.standard_normal(4097).astype(np.float32) * 3.0
+    top_k = 12
+    top_p = 0.75
+
+    # Compute exact top-k / top-p support via brute-force full sort
+    order = np.argsort(logits)[::-1]
+    sorted_vals = logits[order].astype(np.float64)
+    probs = np.exp(sorted_vals - sorted_vals[0])
+    probs /= probs.sum()
+    cum = np.cumsum(probs)
+    over = np.nonzero(cum > top_p)[0]
+    p_cut = int(over[0]) + 1 if over.size > 0 else logits.size
+    expected_support = set(int(i) for i in order[: min(top_k, p_cut)])
+
+    rng = np.random.default_rng(55)
+    drawn = {
+        sample_codebook(logits, temperature=0.8, top_p=top_p, top_k=top_k, rng=rng)
+        for _ in range(300)
+    }
+    assert drawn.issubset(expected_support)
+    assert int(order[0]) in drawn
+
 
 def test_first_semantic_step_blocks_eos() -> None:
     logits = np.full(4097, -10.0, dtype=np.float32)

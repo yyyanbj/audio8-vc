@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import tomllib
 
 from a8vc.lint.core import LintContext, LintFinding, register_rule
 
@@ -207,4 +208,100 @@ def check_ort_imported_before_sherpa(ctx: LintContext) -> list[LintFinding]:
                     hint="Import `onnxruntime` inside a try/except block before `import sherpa_onnx`.",
                 )
             )
+    return findings
+
+
+@register_rule(
+    "RT004",
+    title="Low-latency ONNX tuning, hybrid INT8 AR routing, IOBinding, and streaming defaults must be preserved",
+    category="runtime",
+    description=(
+        "Audio8-0.1B streaming latency depends on partitioned AR/Codec CPU thread pools "
+        "(`compute_thread_plan`), `inter_op_num_threads=1` with active intra-op spinning, "
+        "routing dynamic-INT8 Slow/Fast AR to CPU on CUDA/DirectML/CoreML while accelerating "
+        "FP16 Codec on GPU, CPU IOBinding, concurrent AR+Codec pipelining, and small "
+        "`first_chunk_frames`/`stream_context_frames` defaults."
+    ),
+    history=(
+        "v0.2.2 used serial AR+Codec with stream_context_frames=96, chunk_frames=12, shared "
+        "oversubscribed threads, and GPU-routed INT8 AR on CUDA, causing multi-second TTFA and RTF > 4x."
+    ),
+)
+def check_low_latency_runtime_invariants(ctx: LintContext) -> list[LintFinding]:
+    findings: list[LintFinding] = []
+
+    prov_rel = "src/a8vc/runtime/providers.py"
+    prov_text = ctx.read_text(prov_rel)
+    if prov_text is not None:
+        for token, msg in (
+            ("def compute_thread_plan", "providers.py is missing `compute_thread_plan` AR/Codec thread partitioning."),
+            ("inter_op_num_threads", "providers.py must explicitly configure `inter_op_num_threads`."),
+            ("session.intra_op.allow_spinning", "providers.py must enable `session.intra_op.allow_spinning` for low-latency steps."),
+            ("CUDAExecutionProvider", "providers.py must route dynamic-INT8 AR to CPU when CUDAExecutionProvider is active."),
+        ):
+            if token not in prov_text:
+                findings.append(LintFinding(rule_id="RT004", path=prov_rel, message=msg))
+
+    rt_rel = "src/a8vc/runtime/audio8_onnx.py"
+    rt_text = ctx.read_text(rt_rel)
+    if rt_text is not None:
+        for token, msg in (
+            ("compute_thread_plan", "Audio8OnnxRuntime must partition AR/Codec threads via `compute_thread_plan`."),
+            ("run_with_iobinding", "Audio8OnnxRuntime must support zero-copy CPU `run_with_iobinding` for AR."),
+            ("first_chunk_frames", "Audio8OnnxRuntime must support progressive `first_chunk_frames` for minimal TTFA."),
+            ("pipeline_decode", "Audio8OnnxRuntime must support concurrent AR+Codec `pipeline_decode`."),
+        ):
+            if token not in rt_text:
+                findings.append(LintFinding(rule_id="RT004", path=rt_rel, message=msg))
+
+    toml_rel = "configs/default.toml"
+    toml_text = ctx.read_text(toml_rel)
+    if toml_text is not None:
+        try:
+            data = tomllib.loads(toml_text)
+        except Exception as exc:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message=f"Failed to parse {toml_rel}: {exc}",
+                )
+            )
+            return findings
+        rt_sec = data.get("runtime", {})
+        if not isinstance(rt_sec, dict):
+            rt_sec = {}
+        if int(rt_sec.get("first_chunk_frames", 99)) > 6:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message="default.toml `runtime.first_chunk_frames` exceeds 6 frames (regresses TTFA).",
+                )
+            )
+        if int(rt_sec.get("chunk_frames", 99)) > 12:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message="default.toml `runtime.chunk_frames` exceeds 12 frames (regresses streaming latency).",
+                )
+            )
+        if int(rt_sec.get("stream_context_frames", 999)) > 16:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message="default.toml `runtime.stream_context_frames` exceeds 16 frames (regresses CPU codec RTF).",
+                )
+            )
+        if rt_sec.get("pipeline_decode") is not True:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message="default.toml must keep `runtime.pipeline_decode = true` by default.",
+                )
+            )
+
     return findings

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import queue
 import threading
 import time
 from collections.abc import Iterator
@@ -18,6 +18,7 @@ from a8vc.runtime.manifest import RuntimeManifest, load_runtime_manifest
 from a8vc.runtime.prefix_cache import PrefixStateCache, PrefixStateSnapshot
 from a8vc.runtime.prompt import PromptBuilder
 from a8vc.runtime.providers import (
+    compute_thread_plan,
     create_onnx_session,
     resolve_providers,
     select_model_provider,
@@ -30,6 +31,7 @@ logger = logging.getLogger("a8vc.runtime.audio8_onnx")
 _SLOW_INPUTS = {"codes", "position", "cache_keys", "cache_values", "conv_states", "ssm_states"}
 _SLOW_OUTPUTS = {"logits", "hidden", "key_delta", "value_delta", "next_conv_states", "next_ssm_states"}
 _FAST_BASE_INPUTS = {"slow_hidden", "token_id", "use_slow_hidden", "input_pos"}
+_GUARD_FADE_SAMPLES = 256  # ~5.8 ms at 44.1 kHz; zero-latency overlap crossfade inside guard frame
 
 
 def estimate_max_audio_frames(text: str, *, hard_cap: int = 512) -> int:
@@ -80,6 +82,9 @@ class SynthesisMetrics:
     total_ms: float
     rtf: float
     cache_hit: bool
+    num_chunks: int = 0
+    total_stall_ms: float = 0.0
+    max_stall_ms: float = 0.0
 
 
 @runtime_checkable
@@ -102,6 +107,7 @@ class SynthesizerBackend(Protocol):
         top_k: int | None = None,
         max_new_tokens: int | None = None,
         chunk_frames: int | None = None,
+        first_chunk_frames: int | None = None,
         seed: int | None = None,
     ) -> Iterator[StreamAudioChunk]: ...
 
@@ -156,48 +162,65 @@ class Audio8OnnxRuntime:
                     "Run `python scripts/download_models.py --audio8-onnx`."
                 )
 
-        threads = self.cfg.threads
-        if threads <= 0:
-            cpu_count = os.cpu_count() or 4
-            threads = max(1, min(8, cpu_count // 2))
-        self.threads = threads
-
         slow_req, slow_note = select_model_provider(
             self.cfg.provider,
             model_role="slow_ar",
             precision=self.cfg.precision,
         )
-        self._slow, slow_ep, slow_warn = create_onnx_session(
-            self.manifest.slow_model_path,
-            provider=slow_req,
-            threads=threads,
-        )
-
         fast_req, fast_note = select_model_provider(
             self.cfg.provider,
             model_role="fast_ar",
             precision=self.cfg.precision,
         )
+        dec_req, _ = select_model_provider(
+            self.cfg.provider,
+            model_role="codec_decoder",
+            precision=self.cfg.codec_precision,
+        )
+
+        # Determine whether codec_decoder will execute on GPU so CPU AR & Codec
+        # thread pools can be partitioned without oversubscribing physical cores.
+        try:
+            dec_resolved = resolve_providers(dec_req)
+            codec_expected_gpu = bool(dec_resolved and dec_resolved[0] != "CPUExecutionProvider")
+        except Exception:
+            codec_expected_gpu = False
+
+        self.ar_threads, self.codec_threads, self.threads = compute_thread_plan(
+            threads=self.cfg.threads,
+            ar_threads=self.cfg.ar_threads,
+            codec_threads=self.cfg.codec_threads,
+            codec_on_gpu=codec_expected_gpu,
+            pipeline_decode=self.cfg.pipeline_decode,
+        )
+
+        self._slow, slow_ep, slow_warn = create_onnx_session(
+            self.manifest.slow_model_path,
+            provider=slow_req,
+            threads=self.ar_threads,
+            inter_op_threads=1,
+            allow_spinning=True,
+        )
+
         # If slow_ar attempted GPU and failed, avoid repeating identical GPU init failure on fast_ar
         if slow_warn is not None and slow_ep == "CPUExecutionProvider":
             fast_req = "cpu"
         self._fast, fast_ep, fast_warn = create_onnx_session(
             self.manifest.fast_model_path,
             provider=fast_req,
-            threads=threads,
+            threads=self.ar_threads,
+            inter_op_threads=1,
+            allow_spinning=True,
         )
 
-        dec_req, _ = select_model_provider(
-            self.cfg.provider,
-            model_role="codec_decoder",
-            precision=self.cfg.codec_precision,
-        )
         if slow_warn is not None and slow_ep == "CPUExecutionProvider" and slow_note is None:
             dec_req = "cpu"
         self._decoder, dec_ep, dec_warn = create_onnx_session(
             self.manifest.codec_decoder_path,
             provider=dec_req,
-            threads=threads,
+            threads=self.codec_threads,
+            inter_op_threads=1,
+            allow_spinning=True,
         )
 
         self.session_providers: dict[str, str] = {
@@ -219,11 +242,33 @@ class Audio8OnnxRuntime:
         )
         self.prefix_cache = PrefixStateCache(max_entries=self.cfg.prefix_cache_size)
         self._lock = threading.Lock()
+        self._decoder_lock = threading.Lock()
+        self._decoder_warmed = False
+
+        # Precompute raised-cosine weights for zero-latency guard-overlap crossfade
+        t_fade = np.linspace(0.0, 1.0, _GUARD_FADE_SAMPLES, dtype=np.float32)
+        self._guard_fade_out = 0.5 * (1.0 + np.cos(np.pi * t_fade))
+        self._guard_fade_in = 1.0 - self._guard_fade_out
 
         self._validate_and_inspect_contract()
-        # Reusable single workspace avoids repeated 48 MB allocations across utterances
+        # Reusable workspace + ping-pong Mamba state pair avoids per-step 5 MB copies
         self._workspace = self._allocate_slow_state()
+        self._conv_pair = [
+            self._workspace["conv_states"],
+            np.zeros_like(self._workspace["conv_states"]),
+        ]
+        self._ssm_pair = [
+            self._workspace["ssm_states"],
+            np.zeros_like(self._workspace["ssm_states"]),
+        ]
+        self._slow_state_idx = 0
         self._dirty_seq_len = self.manifest.max_seq_len
+
+        # Reusable Fast-AR buffers avoid per-frame allocations
+        self._fast_caches = self._allocate_fast_caches()
+        self._slow_iobs: list[Any] | None = None
+        self._fast_iob: Any = None
+        self._init_iobinding()
 
     @property
     def sample_rate(self) -> int:
@@ -318,6 +363,155 @@ class Audio8OnnxRuntime:
                 return ep
         return "CPUExecutionProvider"
 
+    def _init_iobinding(self) -> None:
+        """Bind pre-allocated CPU OrtValue buffers for zero-copy Slow-AR and Fast-AR execution."""
+        self._slow_iobs = None
+        self._fast_iob = None
+        try:
+            import onnxruntime as ort
+        except Exception:
+            return
+
+        # Slow-AR CPU IOBinding with ping-pong Mamba conv/ssm buffers (eliminates 5 MB copy/step)
+        if (
+            self.session_providers.get("slow_ar") == "CPUExecutionProvider"
+            and hasattr(self._slow, "io_binding")
+        ):
+            try:
+                out_meta = {out.name: out for out in self._slow.get_outputs()}
+                concrete_shapes: dict[str, tuple[int, ...]] = {}
+                for name in ("logits", "hidden", "key_delta", "value_delta"):
+                    raw_shape = out_meta[name].shape
+                    if not raw_shape or not all(isinstance(d, int) and d > 0 for d in raw_shape):
+                        concrete_shapes = {}
+                        break
+                    concrete_shapes[name] = tuple(int(d) for d in raw_shape)
+
+                if concrete_shapes:
+                    self._slow_col_buf = np.zeros(
+                        (1, self.manifest.num_codebooks + 1, 1),
+                        dtype=self._slow_dtypes["codes"],
+                    )
+                    self._slow_pos_buf = np.zeros((1,), dtype=self._slow_dtypes["position"])
+                    self._slow_logits_buf = np.empty(
+                        concrete_shapes["logits"],
+                        dtype=_ort_type_to_numpy(out_meta["logits"].type),
+                    )
+                    self._slow_hidden_buf = np.empty(
+                        concrete_shapes["hidden"],
+                        dtype=_ort_type_to_numpy(out_meta["hidden"].type),
+                    )
+                    self._slow_kd_buf = np.empty(
+                        concrete_shapes["key_delta"],
+                        dtype=_ort_type_to_numpy(out_meta["key_delta"].type),
+                    )
+                    self._slow_vd_buf = np.empty(
+                        concrete_shapes["value_delta"],
+                        dtype=_ort_type_to_numpy(out_meta["value_delta"].type),
+                    )
+
+                    ov_col = ort.OrtValue.ortvalue_from_numpy(self._slow_col_buf)
+                    ov_pos = ort.OrtValue.ortvalue_from_numpy(self._slow_pos_buf)
+                    ov_ck = ort.OrtValue.ortvalue_from_numpy(self._workspace["cache_keys"])
+                    ov_cv = ort.OrtValue.ortvalue_from_numpy(self._workspace["cache_values"])
+                    ov_conv = [ort.OrtValue.ortvalue_from_numpy(x) for x in self._conv_pair]
+                    ov_ssm = [ort.OrtValue.ortvalue_from_numpy(x) for x in self._ssm_pair]
+                    ov_logits = ort.OrtValue.ortvalue_from_numpy(self._slow_logits_buf)
+                    ov_hidden = ort.OrtValue.ortvalue_from_numpy(self._slow_hidden_buf)
+                    ov_kd = ort.OrtValue.ortvalue_from_numpy(self._slow_kd_buf)
+                    ov_vd = ort.OrtValue.ortvalue_from_numpy(self._slow_vd_buf)
+                    # Hold strong references so OrtValue memory pointers remain alive
+                    self._slow_ort_refs = (
+                        ov_col,
+                        ov_pos,
+                        ov_ck,
+                        ov_cv,
+                        ov_conv,
+                        ov_ssm,
+                        ov_logits,
+                        ov_hidden,
+                        ov_kd,
+                        ov_vd,
+                    )
+
+                    iobs: list[Any] = []
+                    for cur in (0, 1):
+                        nxt = 1 - cur
+                        iob = self._slow.io_binding()
+                        iob.bind_ortvalue_input("codes", ov_col)
+                        iob.bind_ortvalue_input("position", ov_pos)
+                        iob.bind_ortvalue_input("cache_keys", ov_ck)
+                        iob.bind_ortvalue_input("cache_values", ov_cv)
+                        iob.bind_ortvalue_input("conv_states", ov_conv[cur])
+                        iob.bind_ortvalue_input("ssm_states", ov_ssm[cur])
+                        iob.bind_ortvalue_output("logits", ov_logits)
+                        iob.bind_ortvalue_output("hidden", ov_hidden)
+                        iob.bind_ortvalue_output("key_delta", ov_kd)
+                        iob.bind_ortvalue_output("value_delta", ov_vd)
+                        iob.bind_ortvalue_output("next_conv_states", ov_conv[nxt])
+                        iob.bind_ortvalue_output("next_ssm_states", ov_ssm[nxt])
+                        iobs.append(iob)
+                    self._slow_iobs = iobs
+            except Exception as exc:
+                logger.debug("Slow-AR IOBinding unavailable, using standard run(): %s", exc)
+                self._slow_iobs = None
+
+        # Fast-AR CPU IOBinding with reusable cache & output buffers
+        if (
+            self.session_providers.get("fast_ar") == "CPUExecutionProvider"
+            and hasattr(self._fast, "io_binding")
+        ):
+            try:
+                fast_in = {inp.name: inp for inp in self._fast.get_inputs()}
+                fast_outs = list(self._fast.get_outputs())
+                hidden_shape = fast_in["slow_hidden"].shape
+                if (
+                    all(isinstance(d, int) and d > 0 for d in hidden_shape)
+                    and all(
+                        out.shape and all(isinstance(d, int) and d > 0 for d in out.shape)
+                        for out in fast_outs
+                    )
+                ):
+                    self._fast_hidden_buf = np.zeros(
+                        tuple(int(d) for d in hidden_shape),
+                        dtype=self._fast_dtypes["slow_hidden"],
+                    )
+                    self._fast_tok_buf = np.zeros((1, 1), dtype=self._fast_dtypes["token_id"])
+                    self._fast_use_buf = np.array([True], dtype=self._fast_dtypes["use_slow_hidden"])
+                    self._fast_pos_buf = np.zeros((1,), dtype=self._fast_dtypes["input_pos"])
+                    self._fast_out_bufs = [
+                        np.empty(
+                            tuple(int(d) for d in out.shape),
+                            dtype=_ort_type_to_numpy(out.type),
+                        )
+                        for out in fast_outs
+                    ]
+
+                    refs: list[Any] = []
+                    iob = self._fast.io_binding()
+                    for name, arr in (
+                        ("slow_hidden", self._fast_hidden_buf),
+                        ("token_id", self._fast_tok_buf),
+                        ("use_slow_hidden", self._fast_use_buf),
+                        ("input_pos", self._fast_pos_buf),
+                    ):
+                        ov = ort.OrtValue.ortvalue_from_numpy(arr)
+                        refs.append(ov)
+                        iob.bind_ortvalue_input(name, ov)
+                    for name, arr in self._fast_caches.items():
+                        ov = ort.OrtValue.ortvalue_from_numpy(arr)
+                        refs.append(ov)
+                        iob.bind_ortvalue_input(name, ov)
+                    for out, buf in zip(fast_outs, self._fast_out_bufs, strict=True):
+                        ov = ort.OrtValue.ortvalue_from_numpy(buf)
+                        refs.append(ov)
+                        iob.bind_ortvalue_output(out.name, ov)
+                    self._fast_ort_refs = refs
+                    self._fast_iob = iob
+            except Exception as exc:
+                logger.debug("Fast-AR IOBinding unavailable, using standard run(): %s", exc)
+                self._fast_iob = None
+
     def _fallback_session_to_cpu(self, role: str, exc: Exception) -> None:
         """Rebuild a failing GPU ONNX session on CPU so runtime kernel errors never crash synthesis."""
         prev_ep = self.session_providers.get(role, "CPUExecutionProvider")
@@ -331,6 +525,7 @@ class Audio8OnnxRuntime:
             "fast_ar": "_fast",
             "codec_decoder": "_decoder",
         }
+        role_threads = self.codec_threads if role == "codec_decoder" else self.ar_threads
         model_path = path_map[role]
         msg = (
             f"{role} 在 {prev_ep} 推理阶段执行失败，已自动回退到 CPUExecutionProvider: {exc}"
@@ -339,12 +534,16 @@ class Audio8OnnxRuntime:
         cpu_sess, _, _ = create_onnx_session(
             model_path,
             provider="cpu",
-            threads=self.threads,
+            threads=role_threads,
+            inter_op_threads=1,
+            allow_spinning=True,
         )
         setattr(self, attr_map[role], cpu_sess)
         self.session_providers[role] = "CPUExecutionProvider"
         self.active_provider = self._compute_active_provider()
         self.provider_warning = msg
+        if role in {"slow_ar", "fast_ar"}:
+            self._init_iobinding()
 
     def _slow_step(
         self,
@@ -352,6 +551,19 @@ class Audio8OnnxRuntime:
         position: int,
         state: dict[str, np.ndarray],
     ) -> tuple[np.ndarray, np.ndarray]:
+        if self._slow_iobs is not None and state is self._workspace:
+            np.copyto(self._slow_col_buf, column)
+            self._slow_pos_buf[0] = position
+            self._slow.run_with_iobinding(self._slow_iobs[self._slow_state_idx])
+            self._slow_state_idx ^= 1
+            self._workspace["conv_states"] = self._conv_pair[self._slow_state_idx]
+            self._workspace["ssm_states"] = self._ssm_pair[self._slow_state_idx]
+            kd = self._slow_kd_buf
+            vd = self._slow_vd_buf
+            state["cache_keys"][:, :, :, position, :] = kd[:, :, :, 0, :] if kd.ndim == 5 else kd
+            state["cache_values"][:, :, :, position, :] = vd[:, :, :, 0, :] if vd.ndim == 5 else vd
+            return self._slow_logits_buf[0, -1], self._slow_hidden_buf[:, -1:, :]
+
         pos_arr = np.array([position], dtype=self._slow_dtypes["position"])
         feed = {
             "codes": np.ascontiguousarray(column, dtype=self._slow_dtypes["codes"]),
@@ -413,6 +625,75 @@ class Audio8OnnxRuntime:
             fast_caches[f"cache_value_{layer_idx}"][:, :, input_pos : input_pos + v_len, :] = v_delta
         return logits
 
+    def _decode_fast_frame(
+        self,
+        slow_hidden: np.ndarray,
+        semantic_rel_idx: int,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Decode all acoustic codebooks (1..num_codebooks-1) for one semantic frame."""
+        frame = np.zeros(self.manifest.num_codebooks, dtype=np.int64)
+        frame[0] = semantic_rel_idx
+
+        for buf in self._fast_caches.values():
+            buf.fill(0)
+
+        if self._fast_iob is not None:
+            np.copyto(self._fast_hidden_buf, slow_hidden)
+            self._fast_tok_buf[0, 0] = 0
+            self._fast_use_buf[0] = True
+            self._fast_pos_buf[0] = 0
+            self._fast.run_with_iobinding(self._fast_iob)
+            for layer_idx in range(self.manifest.num_fast_layers):
+                kd = self._fast_out_bufs[1 + 2 * layer_idx]
+                vd = self._fast_out_bufs[2 + 2 * layer_idx]
+                self._fast_caches[f"cache_key_{layer_idx}"][:, :, : kd.shape[2], :] = kd
+                self._fast_caches[f"cache_value_{layer_idx}"][:, :, : vd.shape[2], :] = vd
+
+            prev_code = int(semantic_rel_idx)
+            self._fast_use_buf[0] = False
+            for cb_idx in range(1, self.manifest.num_codebooks):
+                self._fast_tok_buf[0, 0] = prev_code
+                self._fast_pos_buf[0] = cb_idx
+                self._fast.run_with_iobinding(self._fast_iob)
+                for layer_idx in range(self.manifest.num_fast_layers):
+                    kd = self._fast_out_bufs[1 + 2 * layer_idx]
+                    vd = self._fast_out_bufs[2 + 2 * layer_idx]
+                    self._fast_caches[f"cache_key_{layer_idx}"][
+                        :, :, cb_idx : cb_idx + kd.shape[2], :
+                    ] = kd
+                    self._fast_caches[f"cache_value_{layer_idx}"][
+                        :, :, cb_idx : cb_idx + vd.shape[2], :
+                    ] = vd
+                prev_code = sample_codebook(
+                    self._fast_out_bufs[0][0, -1],
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    rng=rng,
+                )
+                frame[cb_idx] = prev_code
+            return frame
+
+        # Fallback non-IOBinding path (e.g. GPU Fast-AR or dynamic shapes)
+        _ = self._fast_step(slow_hidden, 0, True, 0, self._fast_caches)
+        prev_code = int(frame[0])
+        for cb_idx in range(1, self.manifest.num_codebooks):
+            cb_logits = self._fast_step(slow_hidden, prev_code, False, cb_idx, self._fast_caches)
+            prev_code = sample_codebook(
+                cb_logits,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                rng=rng,
+            )
+            frame[cb_idx] = prev_code
+        return frame
+
     def _prepare_voice_prefix(self, voice: VoicePack) -> tuple[int, bool]:
         """Restore cached Slow-AR prefix state or prefill system turn and store snapshot."""
         key = voice.cache_key
@@ -440,10 +721,18 @@ class Audio8OnnxRuntime:
         return prefix_len, False
 
     def warm_voice(self, voice: VoicePack) -> float:
-        """Pre-compute and cache a voice's Slow-AR prefix state; returns elapsed ms."""
+        """Pre-compute and cache a voice's Slow-AR prefix state (and warm codec once); returns elapsed ms."""
         t0 = time.perf_counter()
         with self._lock:
             self._prepare_voice_prefix(voice)
+            if not self._decoder_warmed:
+                warm_frames = min(4, int(voice.codes.shape[1]))
+                if warm_frames > 0:
+                    try:
+                        self.decode_codes(voice.codes[:, :warm_frames])
+                        self._decoder_warmed = True
+                    except Exception:
+                        logger.debug("Optional codec warmup skipped", exc_info=True)
         return (time.perf_counter() - t0) * 1000.0
 
     def decode_codes(self, codes: np.ndarray) -> np.ndarray:
@@ -456,13 +745,14 @@ class Audio8OnnxRuntime:
                 f"Expected codes shape [1, {self.manifest.num_codebooks}, T], got {arr.shape}"
             )
         feed = {self._decoder_input_name: np.ascontiguousarray(arr)}
-        try:
-            audio = self._decoder.run(None, feed)[0]
-        except Exception as exc:
-            if self.session_providers.get("codec_decoder") == "CPUExecutionProvider":
-                raise
-            self._fallback_session_to_cpu("codec_decoder", exc)
-            audio = self._decoder.run(None, feed)[0]
+        with self._decoder_lock:
+            try:
+                audio = self._decoder.run(None, feed)[0]
+            except Exception as exc:
+                if self.session_providers.get("codec_decoder") == "CPUExecutionProvider":
+                    raise
+                self._fallback_session_to_cpu("codec_decoder", exc)
+                audio = self._decoder.run(None, feed)[0]
         return np.ascontiguousarray(np.asarray(audio, dtype=np.float32).reshape(-1))
 
     def stream_audio(
@@ -476,9 +766,15 @@ class Audio8OnnxRuntime:
         top_k: int | None = None,
         max_new_tokens: int | None = None,
         chunk_frames: int | None = None,
+        first_chunk_frames: int | None = None,
         seed: int | None = None,
     ) -> Iterator[StreamAudioChunk]:
-        """Generate and stream target-voice audio chunks for `text` using `voice`."""
+        """Generate and stream target-voice audio chunks for `text` using `voice`.
+
+        Uses progressive first-chunk emission, zero-latency guard-overlap crossfading,
+        and (when `cfg.pipeline_decode=True`) concurrent AR/Codec pipelining to minimize
+        both TTFA and end-to-end streaming RTF.
+        """
         temp = self.cfg.temperature if temperature is None else temperature
         p_val = self.cfg.top_p if top_p is None else top_p
         k_val = self.cfg.top_k if top_k is None else top_k
@@ -487,7 +783,13 @@ class Audio8OnnxRuntime:
             if max_new_tokens is None
             else max_new_tokens
         )
-        emit_every = max(2, self.cfg.chunk_frames if chunk_frames is None else chunk_frames)
+        emit_every = max(2, self.cfg.chunk_frames if chunk_frames is None else int(chunk_frames))
+        raw_first = (
+            self.cfg.first_chunk_frames
+            if first_chunk_frames is None
+            else int(first_chunk_frames)
+        )
+        first_emit = max(2, min(emit_every, raw_first))
         context_frames = min(self.cfg.stream_context_frames, self.manifest.stream_context_frames)
         guard_frames = self.cfg.stream_guard_frames
         hop = self.manifest.codec_hop_length
@@ -499,125 +801,236 @@ class Audio8OnnxRuntime:
 
         with self._lock:
             t_start = time.perf_counter()
-            prefix_len, cache_hit = self._prepare_voice_prefix(voice)
-
-            max_avail = self.manifest.max_seq_len - (prefix_len + user_len)
-            if max_avail <= 1:
-                raise ValueError(
-                    f"Prompt length ({prefix_len + user_len}) leaves no generation room "
-                    f"in max_seq_len={self.manifest.max_seq_len}"
-                )
-            step_budget = min(int(max_steps), max_avail)
-
-            logits = np.empty(0, dtype=np.float32)
-            hidden = np.empty(0, dtype=np.float32)
-            for offset in range(user_len):
-                if cancel_event is not None and cancel_event.is_set():
-                    return
-                pos = prefix_len + offset
-                logits, hidden = self._slow_step(
-                    user_prompt[:, :, offset : offset + 1], pos, self._workspace
-                )
-                self._dirty_seq_len = max(self._dirty_seq_len, pos + 1)
-
-            prefill_ms = (time.perf_counter() - t_start) * 1000.0
-            prompt_len = prefix_len + user_len
-
-            frames: list[np.ndarray] = []
-            semantic_history: list[int] = []
             emitted_samples = 0
             ttfa_ms = 0.0
-            eos_index = self.manifest.codebook_size
+            prev_guard: np.ndarray | None = None
 
-            for step in range(step_budget):
-                if cancel_event is not None and cancel_event.is_set():
-                    return
+            def _decode_chunk(
+                window: np.ndarray,
+                start_frame: int,
+                frames_generated: int,
+                prefill_ms: float,
+                cache_hit: bool,
+                is_final: bool,
+            ) -> StreamAudioChunk | None:
+                nonlocal emitted_samples, ttfa_ms, prev_guard
+                decoded = self.decode_codes(window)
+                self._decoder_warmed = True
+                abs_start = start_frame * hop
+                if not is_final:
+                    stable_end = abs_start + max(0, decoded.size - guard_samples)
+                    begin = max(0, emitted_samples - abs_start)
+                    end = max(begin, stable_end - abs_start)
+                else:
+                    begin = max(0, emitted_samples - abs_start)
+                    end = decoded.size
 
-                rel_idx = sample_semantic(
-                    logits,
-                    semantic_history,
-                    temperature=temp,
-                    top_p=p_val,
-                    top_k=k_val,
-                    rng=rng,
+                if end > begin:
+                    piece = decoded[begin:end].copy()
+                    if prev_guard is not None and piece.size > 0:
+                        ov = min(prev_guard.size, piece.size)
+                        if ov == _GUARD_FADE_SAMPLES:
+                            f_out = self._guard_fade_out
+                            f_in = self._guard_fade_in
+                        else:
+                            t_ov = np.linspace(0.0, 1.0, ov, dtype=np.float32)
+                            f_out = 0.5 * (1.0 + np.cos(np.pi * t_ov))
+                            f_in = 1.0 - f_out
+                        piece[:ov] = prev_guard[:ov] * f_out + piece[:ov] * f_in
+                    emitted_samples = abs_start + end
+                    if not is_final and end < decoded.size:
+                        ov_next = min(_GUARD_FADE_SAMPLES, decoded.size - end)
+                        prev_guard = decoded[end : end + ov_next].copy()
+                    else:
+                        prev_guard = None
+                    if ttfa_ms == 0.0:
+                        ttfa_ms = (time.perf_counter() - t_start) * 1000.0
+                    return StreamAudioChunk(
+                        audio=piece,
+                        sample_rate=self.manifest.sample_rate,
+                        frames_generated=frames_generated,
+                        ttfa_ms=ttfa_ms,
+                        prefill_ms=prefill_ms,
+                        cache_hit=cache_hit,
+                        is_final=is_final,
+                    )
+
+                if is_final:
+                    prev_guard = None
+                    if ttfa_ms == 0.0:
+                        ttfa_ms = (time.perf_counter() - t_start) * 1000.0
+                    return StreamAudioChunk(
+                        audio=np.zeros(0, dtype=np.float32),
+                        sample_rate=self.manifest.sample_rate,
+                        frames_generated=frames_generated,
+                        ttfa_ms=ttfa_ms,
+                        prefill_ms=prefill_ms,
+                        cache_hit=cache_hit,
+                        is_final=True,
+                    )
+                return None
+
+            def _is_cancelled(local_cancel: threading.Event | None = None) -> bool:
+                return bool(
+                    (cancel_event is not None and cancel_event.is_set())
+                    or (local_cancel is not None and local_cancel.is_set())
                 )
-                if rel_idx == eos_index:
-                    break
 
-                semantic_token = self.manifest.semantic_begin_id + rel_idx
-                semantic_history.append(rel_idx)
+            def _iter_windows(
+                local_cancel: threading.Event | None = None,
+            ) -> Iterator[tuple[np.ndarray, int, int, float, bool, bool]]:
+                prefix_len, cache_hit = self._prepare_voice_prefix(voice)
+                max_avail = self.manifest.max_seq_len - (prefix_len + user_len)
+                if max_avail <= 1:
+                    raise ValueError(
+                        f"Prompt length ({prefix_len + user_len}) leaves no generation room "
+                        f"in max_seq_len={self.manifest.max_seq_len}"
+                    )
+                step_budget = min(int(max_steps), max_avail)
 
-                frame = np.zeros(self.manifest.num_codebooks, dtype=np.int64)
-                frame[0] = rel_idx
+                logits = np.empty(0, dtype=np.float32)
+                hidden = np.empty(0, dtype=np.float32)
+                for offset in range(user_len):
+                    if _is_cancelled(local_cancel):
+                        return
+                    pos = prefix_len + offset
+                    logits, hidden = self._slow_step(
+                        user_prompt[:, :, offset : offset + 1], pos, self._workspace
+                    )
+                    self._dirty_seq_len = max(self._dirty_seq_len, pos + 1)
 
-                fast_caches = self._allocate_fast_caches()
-                # Fast step 0 ingests slow_hidden; steps 1..9 decode acoustic codebooks
-                _ = self._fast_step(hidden, 0, True, 0, fast_caches)
-                prev_code = int(frame[0])
-                for cb_idx in range(1, self.manifest.num_codebooks):
-                    cb_logits = self._fast_step(hidden, prev_code, False, cb_idx, fast_caches)
-                    prev_code = sample_codebook(
-                        cb_logits,
+                prefill_ms = (time.perf_counter() - t_start) * 1000.0
+                prompt_len = prefix_len + user_len
+
+                frames: list[np.ndarray] = []
+                semantic_history: list[int] = []
+                eos_index = self.manifest.codebook_size
+                next_emit = first_emit
+                last_emit_nf = 0
+                column = np.empty((1, self.manifest.num_codebooks + 1, 1), dtype=np.int64)
+
+                for step in range(step_budget):
+                    if _is_cancelled(local_cancel):
+                        return
+
+                    rel_idx = sample_semantic(
+                        logits,
+                        semantic_history,
                         temperature=temp,
                         top_p=p_val,
                         top_k=k_val,
                         rng=rng,
                     )
-                    frame[cb_idx] = prev_code
+                    if rel_idx == eos_index:
+                        break
 
-                frames.append(frame)
+                    semantic_token = self.manifest.semantic_begin_id + rel_idx
+                    semantic_history.append(rel_idx)
 
-                # Feed completed frame back into Slow-AR for next frame prediction
-                column = np.empty((1, self.manifest.num_codebooks + 1, 1), dtype=np.int64)
-                column[0, 0, 0] = semantic_token
-                column[0, 1:, 0] = frame
-                next_pos = prompt_len + step
-                if next_pos < self.manifest.max_seq_len:
-                    logits, hidden = self._slow_step(column, next_pos, self._workspace)
-                    self._dirty_seq_len = max(self._dirty_seq_len, next_pos + 1)
+                    frame = self._decode_fast_frame(
+                        hidden,
+                        rel_idx,
+                        temperature=temp,
+                        top_p=p_val,
+                        top_k=k_val,
+                        rng=rng,
+                    )
+                    frames.append(frame)
 
-                if len(frames) % emit_every == 0:
-                    start_frame = max(0, len(frames) - context_frames - emit_every)
-                    window = np.stack(frames[start_frame:], axis=1)  # [10, W]
-                    decoded = self.decode_codes(window)
-                    abs_start = start_frame * hop
-                    stable_end = abs_start + max(0, decoded.size - guard_samples)
-                    begin = max(0, emitted_samples - abs_start)
-                    end = max(begin, stable_end - abs_start)
-                    if end > begin:
-                        piece = decoded[begin:end].copy()
-                        emitted_samples = abs_start + end
-                        if ttfa_ms == 0.0:
-                            ttfa_ms = (time.perf_counter() - t_start) * 1000.0
-                        yield StreamAudioChunk(
-                            audio=piece,
-                            sample_rate=self.manifest.sample_rate,
-                            frames_generated=len(frames),
-                            ttfa_ms=ttfa_ms,
-                            prefill_ms=prefill_ms,
-                            cache_hit=cache_hit,
-                            is_final=False,
-                        )
+                    # Dispatch completed chunk to Codec BEFORE next Slow-AR step (~25 ms head-start)
+                    if len(frames) == next_emit:
+                        step_sz = len(frames) - last_emit_nf
+                        start_frame = max(0, len(frames) - context_frames - step_sz)
+                        window = np.stack(frames[start_frame:], axis=1)
+                        yield (window, start_frame, len(frames), prefill_ms, cache_hit, False)
+                        last_emit_nf = len(frames)
+                        next_emit += emit_every
+                        if _is_cancelled(local_cancel):
+                            return
 
-            # Flush final tail samples
-            if frames and not (cancel_event is not None and cancel_event.is_set()):
-                start_frame = max(0, len(frames) - context_frames - emit_every)
-                window = np.stack(frames[start_frame:], axis=1)
-                decoded = self.decode_codes(window)
-                abs_start = start_frame * hop
-                begin = max(0, emitted_samples - abs_start)
-                tail = decoded[begin:].copy() if begin < decoded.size else np.zeros(0, dtype=np.float32)
-                if ttfa_ms == 0.0:
-                    ttfa_ms = (time.perf_counter() - t_start) * 1000.0
-                yield StreamAudioChunk(
-                    audio=tail,
-                    sample_rate=self.manifest.sample_rate,
-                    frames_generated=len(frames),
-                    ttfa_ms=ttfa_ms,
-                    prefill_ms=prefill_ms,
-                    cache_hit=cache_hit,
-                    is_final=True,
-                )
+                    # Feed completed frame back into Slow-AR for next frame prediction
+                    next_pos = prompt_len + step
+                    if step + 1 < step_budget and next_pos < self.manifest.max_seq_len:
+                        column[0, 0, 0] = semantic_token
+                        column[0, 1:, 0] = frame
+                        logits, hidden = self._slow_step(column, next_pos, self._workspace)
+                        self._dirty_seq_len = max(self._dirty_seq_len, next_pos + 1)
+
+                if frames and not _is_cancelled(local_cancel):
+                    step_sz = max(guard_frames, 1, len(frames) - last_emit_nf)
+                    start_frame = max(0, len(frames) - context_frames - step_sz)
+                    window = np.stack(frames[start_frame:], axis=1)
+                    yield (window, start_frame, len(frames), prefill_ms, cache_hit, True)
+
+            if not self.cfg.pipeline_decode:
+                for item in _iter_windows():
+                    chunk = _decode_chunk(*item)
+                    if chunk is not None:
+                        yield chunk
+                return
+
+            # Concurrent pipelined mode: AR runs in dedicated producer thread while caller
+            # thread decodes codec windows in parallel and yields chunks immediately.
+            decode_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=4)
+            local_cancel = threading.Event()
+
+            def _put_item(tag: str, payload: Any) -> None:
+                while True:
+                    if _is_cancelled(local_cancel):
+                        return
+                    try:
+                        decode_queue.put((tag, payload), timeout=0.05)
+                        return
+                    except queue.Full:
+                        if _is_cancelled(local_cancel):
+                            return
+
+            def _ar_worker() -> None:
+                try:
+                    for item in _iter_windows(local_cancel=local_cancel):
+                        _put_item("chunk", item)
+                    _put_item("done", None)
+                except Exception as exc:
+                    _put_item("error", exc)
+
+            ar_thread = threading.Thread(
+                target=_ar_worker,
+                name="a8vc-ar-producer",
+                daemon=True,
+            )
+            ar_thread.start()
+            try:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        local_cancel.set()
+                        break
+                    try:
+                        tag, payload = decode_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        if not ar_thread.is_alive():
+                            try:
+                                tag, payload = decode_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        else:
+                            continue
+                    if tag == "done":
+                        break
+                    if tag == "error":
+                        raise payload
+                    if _is_cancelled(local_cancel):
+                        break
+                    chunk = _decode_chunk(*payload)
+                    if chunk is not None:
+                        yield chunk
+            finally:
+                local_cancel.set()
+                while True:
+                    try:
+                        decode_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                ar_thread.join()
 
     def synthesize(
         self,
@@ -626,18 +1039,38 @@ class Audio8OnnxRuntime:
         *,
         seed: int | None = None,
     ) -> tuple[np.ndarray, SynthesisMetrics]:
-        """Synthesize full utterance and collect latency / RTF metrics."""
+        """Synthesize full utterance and collect latency, stall, and RTF metrics."""
         t0 = time.perf_counter()
         pieces: list[np.ndarray] = []
+        emit_times_ms: list[float] = []
+        chunk_durs_ms: list[float] = []
         last_chunk: StreamAudioChunk | None = None
         for chunk in self.stream_audio(text, voice, seed=seed):
             last_chunk = chunk
             if chunk.audio.size > 0:
+                now_ms = (time.perf_counter() - t0) * 1000.0
                 pieces.append(chunk.audio)
+                emit_times_ms.append(now_ms)
+                chunk_durs_ms.append(chunk.audio.size / float(self.manifest.sample_rate) * 1000.0)
         total_ms = (time.perf_counter() - t0) * 1000.0
         audio = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
         audio_sec = audio.size / float(self.manifest.sample_rate)
         rtf = (total_ms / 1000.0) / audio_sec if audio_sec > 0 else 0.0
+
+        total_stall_ms = 0.0
+        max_stall_ms = 0.0
+        if emit_times_ms:
+            play_cursor = emit_times_ms[0]
+            for arrival_ms, dur_ms in zip(emit_times_ms, chunk_durs_ms, strict=True):
+                if arrival_ms > play_cursor:
+                    stall = arrival_ms - play_cursor
+                    total_stall_ms += stall
+                    if stall > max_stall_ms:
+                        max_stall_ms = stall
+                    play_cursor = arrival_ms + dur_ms
+                else:
+                    play_cursor += dur_ms
+
         metrics = SynthesisMetrics(
             voice_id=voice.voice_id,
             num_frames=last_chunk.frames_generated if last_chunk else 0,
@@ -647,6 +1080,9 @@ class Audio8OnnxRuntime:
             total_ms=round(total_ms, 2),
             rtf=round(rtf, 3),
             cache_hit=last_chunk.cache_hit if last_chunk else False,
+            num_chunks=len(pieces),
+            total_stall_ms=round(total_stall_ms, 2),
+            max_stall_ms=round(max_stall_ms, 2),
         )
         return audio, metrics
 
@@ -655,6 +1091,8 @@ class Audio8OnnxRuntime:
 
     def close(self) -> None:
         self.prefix_cache.clear()
+        self._slow_iobs = None
+        self._fast_iob = None
         self._slow = None
         self._fast = None
         self._decoder = None

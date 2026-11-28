@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from a8vc.asr.base import ASRBackend
-from a8vc.audio.io import crossfade_append, ensure_mono_float32, resample_audio
+from a8vc.audio.io import ensure_mono_float32, resample_audio
 from a8vc.audio.vad import SpeechSegment, SpeechSegmenter
 from a8vc.engine.base import VCOutputEvent, VoiceConversionEngine
 from a8vc.runtime.audio8_onnx import SynthesizerBackend
@@ -85,16 +85,15 @@ class CascadedVCEngine(VoiceConversionEngine):
         synthesizer: SynthesizerBackend,
         asr: ASRBackend,
         segmenter: SpeechSegmenter,
-        crossfade_ms: int = 12,
+        crossfade_ms: int = 6,
     ) -> None:
         self._synth = synthesizer
         self._asr = asr
         self._segmenter = segmenter
-        self._crossfade_samples = int(round((crossfade_ms / 1000.0) * synthesizer.sample_rate))
+        self._edge_fade_samples = int(round((crossfade_ms / 1000.0) * synthesizer.sample_rate))
         self._voice: VoicePack | None = None
         self._voice_lock = threading.Lock()
         self._cancel_event = threading.Event()
-        self._crossfade_tail = np.zeros(0, dtype=np.float32)
 
         self._segments_processed = 0
         self._last_asr_ms = 0.0
@@ -127,7 +126,6 @@ class CascadedVCEngine(VoiceConversionEngine):
     def reset(self) -> None:
         self._cancel_event.clear()
         self._segmenter.reset()
-        self._crossfade_tail = np.zeros(0, dtype=np.float32)
 
     def _convert_segment(self, segment: SpeechSegment) -> Iterator[VCOutputEvent]:
         voice = self.active_voice
@@ -158,22 +156,21 @@ class CascadedVCEngine(VoiceConversionEngine):
             self._last_prefill_ms = chunk.prefill_ms
             self._last_ttfa_ms = chunk.ttfa_ms
 
+            # Intra-utterance chunks are already seamlessly blended by Audio8OnnxRuntime's
+            # zero-latency guard-overlap crossfade; only apply zero-delay boundary ramps on
+            # utterance start/end to prevent speaker clicks without holding back samples.
             emit_audio = chunk.audio
-            if self._crossfade_samples > 0 and emit_audio.size > 0:
-                emit_audio, self._crossfade_tail = crossfade_append(
-                    self._crossfade_tail,
-                    emit_audio,
-                    self._crossfade_samples,
-                )
+            if self._edge_fade_samples > 0 and emit_audio.size > 0 and (first_chunk or chunk.is_final):
+                emit_audio = emit_audio.copy()
+                fade_n = min(self._edge_fade_samples, emit_audio.size)
+                t_fade = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+                ramp = 0.5 * (1.0 - np.cos(np.pi * t_fade))
+                if first_chunk:
+                    emit_audio[:fade_n] *= ramp
+                if chunk.is_final:
+                    emit_audio[-fade_n:] *= ramp[::-1]
 
             if emit_audio.size > 0 or chunk.is_final:
-                if chunk.is_final and self._crossfade_tail.size > 0:
-                    emit_audio = (
-                        np.concatenate([emit_audio, self._crossfade_tail])
-                        if emit_audio.size > 0
-                        else self._crossfade_tail.copy()
-                    )
-                    self._crossfade_tail = np.zeros(0, dtype=np.float32)
                 yield VCOutputEvent(
                     audio=emit_audio,
                     sample_rate=chunk.sample_rate,
@@ -235,7 +232,7 @@ class RealtimeVCWorker:
         engine: CascadedVCEngine,
         on_event: Callable[[VCOutputEvent], None],
         *,
-        max_pending_segments: int = 2,
+        max_pending_segments: int = 1,
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self.engine = engine

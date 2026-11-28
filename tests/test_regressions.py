@@ -83,6 +83,8 @@ def test_create_vad_accepts_str_path_and_falls_back_on_corrupted_onnx(tmp_path: 
 
 def test_select_model_provider_guards_directml_int8_ar_models() -> None:
     dml_avail = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    cuda_avail = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    coreml_avail = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
 
     slow_ep, slow_note = select_model_provider(
         "dml", model_role="slow_ar", precision="int8", available=dml_avail
@@ -93,17 +95,30 @@ def test_select_model_provider_guards_directml_int8_ar_models() -> None:
     dec_ep, dec_note = select_model_provider(
         "dml", model_role="codec_decoder", precision="fp16", available=dml_avail
     )
-    cuda_ep, cuda_note = select_model_provider(
-        "cuda",
-        model_role="slow_ar",
-        precision="int8",
-        available=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    cuda_int8_ep, cuda_int8_note = select_model_provider(
+        "cuda", model_role="slow_ar", precision="int8", available=cuda_avail
+    )
+    cuda_dec_ep, cuda_dec_note = select_model_provider(
+        "cuda", model_role="codec_decoder", precision="fp16", available=cuda_avail
+    )
+    cuda_fp16_ar_ep, cuda_fp16_ar_note = select_model_provider(
+        "cuda", model_role="slow_ar", precision="fp16", available=cuda_avail
+    )
+    coreml_int8_ep, coreml_int8_note = select_model_provider(
+        "coreml", model_role="fast_ar", precision="int8", available=coreml_avail
+    )
+    coreml_dec_ep, coreml_dec_note = select_model_provider(
+        "coreml", model_role="codec_decoder", precision="fp16", available=coreml_avail
     )
 
     assert slow_ep == "cpu" and slow_note is not None
     assert fast_ep == "cpu" and fast_note is not None
     assert dec_ep == "dml" and dec_note is None
-    assert cuda_ep == "cuda" and cuda_note is None
+    assert cuda_int8_ep == "cpu" and cuda_int8_note is not None
+    assert cuda_dec_ep == "cuda" and cuda_dec_note is None
+    assert cuda_fp16_ar_ep == "cuda" and cuda_fp16_ar_note is None
+    assert coreml_int8_ep == "cpu" and coreml_int8_note is not None
+    assert coreml_dec_ep == "coreml" and coreml_dec_note is None
 
 
 def test_tts_stream_primes_first_chunk_and_returns_json_500_on_synthesis_error(
@@ -364,5 +379,259 @@ def test_estimate_max_audio_frames_bounds_short_utterances() -> None:
     assert 120 <= short_en <= 180
     assert 100 <= short_zh <= 160
     assert long_text == 512
+
+
+def test_compute_thread_plan_and_session_options_for_min_latency() -> None:
+    from a8vc.runtime.providers import build_session_options, compute_thread_plan
+
+    # Pipelined CPU mode partitions budget without oversubscription
+    ar16, dec16, tot16 = compute_thread_plan(cpu_count=16, codec_on_gpu=False, pipeline_decode=True)
+    assert tot16 == 8
+    assert ar16 == 3 and dec16 == 5
+    assert ar16 + dec16 <= tot16
+
+    ar8, dec8, tot8 = compute_thread_plan(cpu_count=8, codec_on_gpu=False, pipeline_decode=True)
+    assert tot8 == 4
+    assert ar8 == 2 and dec8 == 2
+    assert ar8 + dec8 <= tot8
+
+    # GPU codec mode keeps AR in its 3-thread sweet spot
+    ar_gpu, dec_gpu, _ = compute_thread_plan(cpu_count=16, codec_on_gpu=True, pipeline_decode=True)
+    assert ar_gpu == 3 and dec_gpu == 2
+
+    # Serial mode allows Codec to use full thread budget
+    ar_ser, dec_ser, tot_ser = compute_thread_plan(
+        cpu_count=16, codec_on_gpu=False, pipeline_decode=False
+    )
+    assert ar_ser == 3 and dec_ser == tot_ser == 8
+
+    # Explicit overrides always win
+    assert compute_thread_plan(threads=10, ar_threads=4, codec_threads=6) == (4, 6, 10)
+
+    # Session options enable low-latency sequential execution, spinning & denormal flush
+    class _FakeSessOpts:
+        def __init__(self) -> None:
+            self.intra_op_num_threads = 0
+            self.inter_op_num_threads = 0
+            self.execution_mode = None
+            self.graph_optimization_level = None
+            self.enable_mem_pattern = True
+            self.entries: dict[str, str] = {}
+
+        def add_session_config_entry(self, key: str, value: str) -> None:
+            self.entries[key] = value
+
+    class _FakeOrt:
+        SessionOptions = _FakeSessOpts
+
+        class ExecutionMode:
+            ORT_SEQUENTIAL = "SEQ"
+
+        class GraphOptimizationLevel:
+            ORT_ENABLE_ALL = "ALL"
+
+    opts = build_session_options(
+        ["CPUExecutionProvider"],
+        threads=3,
+        inter_op_threads=1,
+        allow_spinning=True,
+        ort_module=_FakeOrt,
+    )
+    assert opts.intra_op_num_threads == 3
+    assert opts.inter_op_num_threads == 1
+    assert opts.execution_mode == "SEQ"
+    assert opts.entries["session.intra_op.allow_spinning"] == "1"
+    assert opts.entries["session.set_denormal_as_zero"] == "1"
+
+
+def test_stream_audio_pipelined_matches_serial_and_guard_crossfade(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import types
+
+    from a8vc.config import RuntimeConfig
+    from a8vc.runtime import audio8_onnx
+
+    # Minimal dummy model directory + manifest
+    manifest = {
+        "model_id": "test-mini",
+        "model_fingerprint": "test-mini-v1",
+        "slow_decode_model": "slow.onnx",
+        "fast_model": "fast.onnx",
+        "codec_models": "dec.onnx",
+        "sample_rate": 44100,
+        "codec_hop_length": 512,
+        "num_codebooks": 10,
+        "codebook_size": 32,
+        "semantic_begin_id": 1000,
+        "semantic_end_id": 1031,
+        "im_end_id": 32,
+        "max_seq_len": 128,
+        "num_layers": 2,
+        "n_local_heads": 2,
+        "head_dim": 8,
+        "num_fast_layers": 1,
+        "fast_n_local_heads": 2,
+        "fast_head_dim": 8,
+        "mamba_d_conv": 2,
+        "mamba_d_ssm": 8,
+        "mamba_d_state": 4,
+        "mamba_d_head": 4,
+        "mamba_n_heads": 2,
+        "mamba_n_groups": 1,
+    }
+    (tmp_path / "runtime_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for fname in ("slow.onnx", "fast.onnx", "dec.onnx", "tokenizer.json"):
+        (tmp_path / fname).write_bytes(b"stub")
+
+    class _IO:
+        def __init__(self, name: str, shape: list[int], typ: str) -> None:
+            self.name = name
+            self.shape = shape
+            self.type = typ
+
+    class _FakeSlow:
+        def __init__(self) -> None:
+            self._gen_steps = 0
+
+        def get_inputs(self) -> list[_IO]:
+            return [
+                _IO("codes", [1, 11, 1], "tensor(int64)"),
+                _IO("position", [1], "tensor(int64)"),
+                _IO("cache_keys", [2, 1, 2, 128, 8], "tensor(float)"),
+                _IO("cache_values", [2, 1, 2, 128, 8], "tensor(float)"),
+                _IO("conv_states", [2, 1, 16, 2], "tensor(float)"),
+                _IO("ssm_states", [2, 1, 2, 4, 4], "tensor(float)"),
+            ]
+
+        def get_outputs(self) -> list[_IO]:
+            return [
+                _IO("logits", [1, 1, 33], "tensor(float)"),
+                _IO("hidden", [1, 1, 16], "tensor(float)"),
+                _IO("key_delta", [2, 1, 2, 8], "tensor(float)"),
+                _IO("value_delta", [2, 1, 2, 8], "tensor(float)"),
+                _IO("next_conv_states", [2, 1, 16, 2], "tensor(float)"),
+                _IO("next_ssm_states", [2, 1, 2, 4, 4], "tensor(float)"),
+            ]
+
+        def run(self, _outs: Any, feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            pos = int(feed["position"][0])
+            logits = np.full((1, 1, 33), -20.0, dtype=np.float32)
+            # Emit 14 deterministic audio frames then EOS (index 32)
+            tok = 32 if pos >= 65 else (pos % 30)
+            logits[0, 0, tok] = 10.0
+            hidden = np.full((1, 1, 16), float(pos % 5) * 0.1, dtype=np.float32)
+            kd = np.zeros((2, 1, 2, 8), dtype=np.float32)
+            vd = np.zeros((2, 1, 2, 8), dtype=np.float32)
+            return [logits, hidden, kd, vd, feed["conv_states"].copy(), feed["ssm_states"].copy()]
+
+    class _FakeFast:
+        def get_inputs(self) -> list[_IO]:
+            return [
+                _IO("slow_hidden", [1, 1, 16], "tensor(float)"),
+                _IO("token_id", [1, 1], "tensor(int64)"),
+                _IO("use_slow_hidden", [1], "tensor(bool)"),
+                _IO("input_pos", [1], "tensor(int64)"),
+                _IO("cache_key_0", [1, 2, 10, 8], "tensor(float)"),
+                _IO("cache_value_0", [1, 2, 10, 8], "tensor(float)"),
+            ]
+
+        def get_outputs(self) -> list[_IO]:
+            return [
+                _IO("logits", [1, 1, 32], "tensor(float)"),
+                _IO("key_delta_0", [1, 2, 1, 8], "tensor(float)"),
+                _IO("value_delta_0", [1, 2, 1, 8], "tensor(float)"),
+            ]
+
+        def run(self, _outs: Any, feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            idx = int(feed["input_pos"][0])
+            logits = np.full((1, 1, 32), -20.0, dtype=np.float32)
+            logits[0, 0, (idx * 3) % 32] = 10.0
+            return [
+                logits,
+                np.zeros((1, 2, 1, 8), dtype=np.float32),
+                np.zeros((1, 2, 1, 8), dtype=np.float32),
+            ]
+
+    class _FakeDecoder:
+        def get_inputs(self) -> list[_IO]:
+            return [_IO("codes", [1, 10, 1], "tensor(int64)")]
+
+        def run(self, _outs: Any, feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            codes = feed["codes"]
+            n_frames = codes.shape[2]
+            # Deliberately include a tiny window-length-dependent DC offset to verify guard crossfade
+            base = np.linspace(-0.3, 0.3, n_frames * 512, dtype=np.float32)
+            return [(base + 0.02 * (n_frames % 3)).reshape(1, 1, -1)]
+
+    class _FakeTokenizer:
+        @staticmethod
+        def from_file(_path: str) -> Any:
+            class _Tok:
+                def encode(self, seq: str, add_special_tokens: bool = False) -> Any:
+                    return types.SimpleNamespace(ids=[1 + (i % 50) for i in range(max(1, len(seq) // 8))])
+
+            return _Tok()
+
+    def _fake_create_sess(path: Path, **_kwargs: Any) -> tuple[Any, str, None]:
+        if path.name == "slow.onnx":
+            return _FakeSlow(), "CPUExecutionProvider", None
+        if path.name == "fast.onnx":
+            return _FakeFast(), "CPUExecutionProvider", None
+        return _FakeDecoder(), "CPUExecutionProvider", None
+
+    monkeypatch.setattr(audio8_onnx, "create_onnx_session", _fake_create_sess)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "tokenizers",
+        types.SimpleNamespace(Tokenizer=_FakeTokenizer),
+    )
+
+    pack = build_voice_pack(
+        voice_id="mini",
+        codes=np.zeros((10, 8), dtype=np.int64),
+        reference_text="hi",
+        name="Mini",
+        language="en",
+    )
+
+    rt_pipe = audio8_onnx.Audio8OnnxRuntime(
+        tmp_path,
+        RuntimeConfig(
+            first_chunk_frames=4,
+            chunk_frames=6,
+            stream_context_frames=4,
+            pipeline_decode=True,
+        ),
+    )
+    rt_serial = audio8_onnx.Audio8OnnxRuntime(
+        tmp_path,
+        RuntimeConfig(
+            first_chunk_frames=4,
+            chunk_frames=6,
+            stream_context_frames=4,
+            pipeline_decode=False,
+        ),
+    )
+
+    pipe_chunks = list(rt_pipe.stream_audio("hello test", pack, seed=123))
+    serial_chunks = list(rt_serial.stream_audio("hello test", pack, seed=123))
+
+    assert len(pipe_chunks) >= 2
+    assert pipe_chunks[0].frames_generated == 4  # progressive first_chunk_frames honored
+    assert pipe_chunks[-1].is_final is True
+    pipe_wav = np.concatenate([c.audio for c in pipe_chunks])
+    serial_wav = np.concatenate([c.audio for c in serial_chunks])
+    assert np.array_equal(pipe_wav, serial_wav)
+
+    wav2, metrics = rt_pipe.synthesize("hello test", pack, seed=123)
+    assert metrics.cache_hit is True
+    assert metrics.num_chunks == len(pipe_chunks)
+    assert metrics.total_stall_ms >= 0.0
+    assert metrics.max_stall_ms >= 0.0
+    assert np.array_equal(wav2, pipe_wav)
+    rt_pipe.close()
+    rt_serial.close()
+
 
 

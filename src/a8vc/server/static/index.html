@@ -488,7 +488,11 @@
         throw new Error("当前浏览器不支持 Web Audio API");
       }
       if (!audioCtx || audioCtx.state === "closed") {
-        audioCtx = new AudioCtx();
+        try {
+          audioCtx = new AudioCtx({ latencyHint: "interactive" });
+        } catch {
+          audioCtx = new AudioCtx();
+        }
         nextPlayTime = audioCtx.currentTime;
       }
       if (audioCtx.state === "suspended") {
@@ -1101,7 +1105,11 @@
       if (!audioCtx || audioCtx.state === "closed") {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         if (!AudioCtx) return;
-        audioCtx = new AudioCtx();
+        try {
+          audioCtx = new AudioCtx({ latencyHint: "interactive" });
+        } catch {
+          audioCtx = new AudioCtx();
+        }
       }
       if (audioCtx.state === "suspended") {
         audioCtx.resume().catch(() => {});
@@ -1117,7 +1125,7 @@
       src.buffer = buf;
       src.connect(audioCtx.destination);
       const now = audioCtx.currentTime;
-      if (nextPlayTime < now) nextPlayTime = now + 0.03;
+      if (nextPlayTime < now) nextPlayTime = now + 0.01;
       src.start(nextPlayTime);
       nextPlayTime += buf.duration;
     }
@@ -1146,7 +1154,7 @@
           audio: { echoCancellation: true, noiseSuppression: true }
         });
         micSource = audioCtx.createMediaStreamSource(micStream);
-        processor = audioCtx.createScriptProcessor(2048, 1, 1);
+        processor = audioCtx.createScriptProcessor(1024, 1, 1);
         zeroGain = audioCtx.createGain();
         zeroGain.gain.value = 0;
         processor.onaudioprocess = (ev) => {

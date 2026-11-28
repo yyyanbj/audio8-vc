@@ -10,17 +10,25 @@ vad_model_path = "models/vad/silero_vad.onnx"
 [runtime]
 # ONNX Execution Provider: "cpu" | "cuda" | "coreml" | "dml" | "auto"
 provider = "cpu"
-# CPU 线程数，0 表示自动使用物理核心的一半（避免抢占音频回调线程）
+# 总 CPU 线程预算，0 表示自动按物理核心拆分 AR / Codec 独立线程池（避免抢占与过载）
 threads = 0
+# Slow/Fast AR 独立线程数（0 表示自动 2~3 线程，INT8 单步 AR 最佳低延迟区间）
+ar_threads = 0
+# Codec 解码器独立线程数（0 表示自动分配剩余物理核心；GPU 模式下仅用于 CPU 回退）
+codec_threads = 0
 precision = "int8"
 codec_precision = "fp16"
 # 内存级 LRU 前缀状态缓存容量（每条约 10~12 MB，显著降低重复 prefill 延迟）
-prefix_cache_size = 2
-# 流式解码块大小（帧，21.53 fps；8 帧 ≈ 372ms，12 帧 ≈ 557ms）
-chunk_frames = 10
-# 滑窗解码上下文帧数（降低可减少 CPU 解码耗时，默认 128）
-stream_context_frames = 96
+prefix_cache_size = 4
+# 首包触发帧数（4 帧 ≈ 186ms，含 1 帧 guard 立即输出 ~139ms，极大压缩首字延迟 TTFA）
+first_chunk_frames = 4
+# 稳态流式解码块大小（帧，21.53 fps；8 帧 ≈ 372ms）
+chunk_frames = 8
+# 滑窗解码上下文帧数（配合零延迟 guard 重叠淡变，最小化 CPU 解码耗时同时消除接缝爆音）
+stream_context_frames = 8
 stream_guard_frames = 1
+# 启用 AR 生成与 Codec 解码双线程流水线并行，隐藏解码延迟
+pipeline_decode = true
 # 采样参数
 temperature = 0.7
 top_p = 0.9
@@ -30,21 +38,21 @@ max_new_tokens = 512
 [audio]
 input_sample_rate = 16000
 output_sample_rate = 44100
-input_block_ms = 20
+input_block_ms = 16
 input_device = ""
 output_device = ""
-# 相邻句段拼接淡入淡出时长（ms），消除爆音
-crossfade_ms = 12
+# 句段边界淡入淡出时长（ms），消除起止爆音且不增加句内延迟
+crossfade_ms = 6
 
 [vad]
 # "auto" (有 silero_vad.onnx 用 Silero，否则退回内置能量 VAD) | "energy" | "silero"
 backend = "auto"
 energy_threshold_db = -38.0
-speech_start_ms = 80
-min_silence_ms = 360
-pre_speech_ms = 160
-min_segment_ms = 250
-max_segment_ms = 4500
+speech_start_ms = 64
+min_silence_ms = 192
+pre_speech_ms = 128
+min_segment_ms = 192
+max_segment_ms = 2600
 
 [asr]
 # "sherpa" | "mock"
@@ -58,8 +66,8 @@ provider = "cpu"
 [engine]
 # "cascaded" (Track 1: 零训练即用) | "codec_s2s" (Track 2: 原生 Codec 空间实验/微调引擎)
 mode = "cascaded"
-# 积压超过该段数时丢弃最旧未合成句段，保证实时低延迟不雪崩
-max_pending_segments = 2
+# 仅保留最新 1 段待合成语音，严格杜绝积压雪崩保证最低端到端延迟
+max_pending_segments = 1
 
 [server]
 host = "127.0.0.1"

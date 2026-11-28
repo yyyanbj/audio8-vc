@@ -33,10 +33,62 @@ _AUTO_GPU_PRIORITY = (
     "DmlExecutionProvider",
 )
 
-# Audio8 INT8 autoregressive graphs contain DynamicQuantizeLinear / MatMulInteger /
-# ScatterND ops that are unstable or crash (80070057) on DirectML while FP16 codec
-# conv/attention graphs accelerate cleanly on DirectML GPU.
-_DML_UNSAFE_INT8_ROLES = frozenset({"slow_ar", "fast_ar"})
+# Audio8 INT8 autoregressive graphs contain DynamicQuantizeLinear (121/17) and
+# MatMulInteger (217/21) ops that have no GPU kernels in DirectML, CUDA, or CoreML:
+# - DirectML crashes (80070057) or stalls on dynamic INT8 AR ops.
+# - CUDA/CoreML split the graph into hundreds of CPU/GPU subgraphs with PCIe
+#   MemcpyToHost/MemcpyFromHost on every 1-token step, making AR slower than CPU.
+# Meanwhile FP16 `codec_decoder_fp16.onnx` / `codec_encoder_fp16.onnx` (283 Conv +
+# 46 ConvTranspose + 120 Sin, zero dynamic INT8 ops) accelerate cleanly on GPU.
+_GPU_UNSAFE_OR_SLOW_INT8_ROLES = frozenset({"slow_ar", "fast_ar"})
+_GPU_PROVIDERS_ROUTING_INT8_AR_TO_CPU = frozenset(
+    {
+        "DmlExecutionProvider",
+        "CUDAExecutionProvider",
+        "CoreMLExecutionProvider",
+    }
+)
+
+
+def compute_thread_plan(
+    *,
+    threads: int = 0,
+    ar_threads: int = 0,
+    codec_threads: int = 0,
+    codec_on_gpu: bool = False,
+    pipeline_decode: bool = True,
+    cpu_count: int | None = None,
+) -> tuple[int, int, int]:
+    """Compute low-latency CPU thread counts `(ar_threads, codec_threads, total_budget)`.
+
+    Single-token INT8 AR peaks at 2–4 intra-op threads and degrades sharply with thread
+    oversubscription. When AR and CPU Codec run concurrently (`pipeline_decode=True`),
+    partitioning cores so `ar_threads + codec_threads <= total_budget` eliminates
+    cross-pool contention and cuts both TTFA and RTF.
+    """
+    detected = max(1, int(cpu_count if cpu_count is not None else (os.cpu_count() or 4)))
+    if threads > 0:
+        total = max(1, int(threads))
+    else:
+        total = max(2, min(8, detected // 2))
+
+    if codec_on_gpu or not pipeline_decode:
+        auto_ar = min(3, total) if total >= 3 else total
+        auto_codec = 2 if codec_on_gpu else total
+    else:
+        if total >= 6:
+            auto_ar = 3
+            auto_codec = max(2, total - auto_ar)
+        elif total >= 4:
+            auto_ar = 2
+            auto_codec = max(2, total - auto_ar)
+        else:
+            auto_ar = max(1, total)
+            auto_codec = max(1, total)
+
+    eff_ar = max(1, int(ar_threads)) if ar_threads > 0 else auto_ar
+    eff_codec = max(1, int(codec_threads)) if codec_threads > 0 else auto_codec
+    return eff_ar, eff_codec, total
 
 
 def select_model_provider(
@@ -46,7 +98,7 @@ def select_model_provider(
     precision: str = "",
     available: Iterable[str] | None = None,
 ) -> tuple[str, str | None]:
-    """Select a safe effective provider string for a specific ONNX model role.
+    """Select the fastest safe effective provider string for a specific ONNX model role.
 
     Returns ``(effective_provider, note_or_none)``.
     """
@@ -57,14 +109,21 @@ def select_model_provider(
     resolved = resolve_providers(normalized, available)
     primary = resolved[0] if resolved else "CPUExecutionProvider"
     if (
-        primary == "DmlExecutionProvider"
-        and model_role in _DML_UNSAFE_INT8_ROLES
+        primary in _GPU_PROVIDERS_ROUTING_INT8_AR_TO_CPU
+        and model_role in _GPU_UNSAFE_OR_SLOW_INT8_ROLES
         and precision.strip().lower() == "int8"
     ):
-        note = (
-            "DirectML 对动态 INT8 自回归算子 (DynamicQuantizeLinear/MatMulInteger) 兼容性有限，"
-            "Slow/Fast AR 已自动使用 CPU 执行，Codec 解码器/编码器继续使用 DirectML GPU 加速。"
-        )
+        if primary == "DmlExecutionProvider":
+            note = (
+                "DirectML 对动态 INT8 自回归算子 (DynamicQuantizeLinear/MatMulInteger) 兼容性有限，"
+                "Slow/Fast AR 已自动使用低延迟 CPU 线程池执行，Codec 解码器/编码器继续使用 DirectML GPU 加速。"
+            )
+        else:
+            note = (
+                f"{primary} 缺少动态 INT8 算子 (DynamicQuantizeLinear/MatMulInteger) 原生内核，"
+                "为避免单步推理跨 PCIe 频繁拷贝拖慢延迟，Slow/Fast AR 已自动使用低延迟 CPU 线程池执行，"
+                f"FP16 Codec 解码器/编码器继续使用 {primary} GPU 加速。"
+            )
         return "cpu", note
     return normalized, None
 
@@ -241,28 +300,37 @@ def build_session_options(
     providers: Sequence[str],
     *,
     threads: int = 2,
+    inter_op_threads: int = 1,
+    allow_spinning: bool = True,
     ort_module: Any = None,
 ) -> Any:
-    """Create tuned ONNX Runtime `SessionOptions` for the selected providers.
+    """Create low-latency tuned ONNX Runtime `SessionOptions` for the selected providers.
 
-    Applies DirectML's required sequential execution + disabled memory-pattern settings
-    when `DmlExecutionProvider` is active.
+    Uses sequential execution with `inter_op_num_threads=1`, denormal-as-zero, and
+    active intra-op thread spinning to minimize per-token AR and codec latency.
+    Applies DirectML's required disabled memory-pattern setting when active.
     """
     ort = ort_module
     if ort is None:
         import onnxruntime as ort
 
     safe_threads = max(1, int(threads))
+    safe_inter = max(1, int(inter_op_threads))
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     opts.intra_op_num_threads = safe_threads
-    opts.inter_op_num_threads = max(1, safe_threads // 2)
+    opts.inter_op_num_threads = safe_inter
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.log_severity_level = 3
+
+    add_cfg = getattr(opts, "add_session_config_entry", None)
+    if callable(add_cfg):
+        add_cfg("session.intra_op.allow_spinning", "1" if allow_spinning else "0")
+        add_cfg("session.set_denormal_as_zero", "1")
 
     if "DmlExecutionProvider" in providers:
         # Required by ONNX Runtime DirectML Execution Provider
         opts.enable_mem_pattern = False
-        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
     return opts
 
@@ -287,6 +355,8 @@ def create_onnx_session(
     *,
     provider: str = "cpu",
     threads: int = 2,
+    inter_op_threads: int = 1,
+    allow_spinning: bool = True,
     ort_module: Any = None,
 ) -> tuple[Any, str, str | None]:
     """Create an ONNX Runtime `InferenceSession` with automatic safe CPU fallback.
@@ -317,7 +387,13 @@ def create_onnx_session(
         )
         logger.warning(warning)
 
-    opts = build_session_options(providers, threads=threads, ort_module=ort)
+    opts = build_session_options(
+        providers,
+        threads=threads,
+        inter_op_threads=inter_op_threads,
+        allow_spinning=allow_spinning,
+        ort_module=ort,
+    )
     try:
         session = ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
     except Exception as exc:
@@ -327,7 +403,11 @@ def create_onnx_session(
         warning = _fallback_hint(primary, exc)
         logger.warning("%s", warning)
         cpu_opts = build_session_options(
-            ["CPUExecutionProvider"], threads=threads, ort_module=ort
+            ["CPUExecutionProvider"],
+            threads=threads,
+            inter_op_threads=inter_op_threads,
+            allow_spinning=allow_spinning,
+            ort_module=ort,
         )
         session = ort.InferenceSession(
             str(model_path),

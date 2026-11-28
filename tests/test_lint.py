@@ -230,9 +230,14 @@ def create_vad(cfg, vad_model_path=None):
     return vad_model_path.is_file()
 """,
     )
-    # RT002: missing select_model_provider and fallback
+    # RT002 + RT004: missing select_model_provider, fallback, thread plan, and slow config defaults
     _write(tmp_path, "src/a8vc/runtime/providers.py", "def resolve_providers(): pass\n")
     _write(tmp_path, "src/a8vc/runtime/audio8_onnx.py", "class Audio8OnnxRuntime: pass\n")
+    _write(
+        tmp_path,
+        "configs/default.toml",
+        "[runtime]\nfirst_chunk_frames = 12\nchunk_frames = 24\nstream_context_frames = 96\npipeline_decode = false\n",
+    )
     # RT003: importing sherpa_onnx before onnxruntime
     _write(
         tmp_path,
@@ -284,6 +289,7 @@ def main():
         "RT001",
         "RT002",
         "RT003",
+        "RT004",
         "API001",
         "API002",
         "API003",

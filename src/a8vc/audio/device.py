@@ -73,9 +73,10 @@ def list_audio_devices() -> list[dict[str, Any]]:
 class AudioPlaybackQueue:
     """Lock-protected float32 playback ring queue fed by inference and drained by audio callbacks."""
 
-    def __init__(self, max_seconds: float = 12.0, sample_rate: int = 44100) -> None:
+    def __init__(self, max_seconds: float = 4.0, sample_rate: int = 44100) -> None:
         self.sample_rate = sample_rate
-        self.max_samples = int(max_seconds * sample_rate)
+        self.max_seconds = float(max_seconds)
+        self.max_samples = int(self.max_seconds * sample_rate)
         self._lock = threading.Lock()
         self._chunks: deque[np.ndarray] = deque()
         self._queued_samples = 0
@@ -131,7 +132,7 @@ class LocalAudioBridge:
         on_input_chunk: Callable[[np.ndarray, int], None],
         input_sample_rate: int = 16000,
         output_sample_rate: int = 44100,
-        input_block_ms: int = 20,
+        input_block_ms: int = 16,
         input_device: str | int | None = None,
         output_device: str | int | None = None,
     ) -> None:
@@ -203,7 +204,7 @@ class LocalAudioBridge:
         last_out_err: Exception | None = None
         for sr_out in out_rates:
             self.playback.sample_rate = sr_out
-            self.playback.max_samples = int(12.0 * sr_out)
+            self.playback.max_samples = int(self.playback.max_seconds * sr_out)
 
             def _out_cb(outdata: np.ndarray, frames: int, _time_info: Any, _status: Any) -> None:
                 samples = self.playback.pop(frames)
@@ -212,7 +213,7 @@ class LocalAudioBridge:
             try:
                 out_stream = sd.OutputStream(
                     samplerate=sr_out,
-                    blocksize=1024,
+                    blocksize=512,
                     channels=1,
                     dtype="float32",
                     device=self.output_device,

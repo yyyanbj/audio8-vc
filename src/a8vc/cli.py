@@ -131,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
     synth_p.add_argument("--seed", type=int, default=None, help="Optional RNG seed")
 
     # --- benchmark ---
-    bench_p = sub.add_parser("benchmark", help="Benchmark cold vs prefix-cached TTFA, RTF & RAM")
+    bench_p = sub.add_parser("benchmark", help="Benchmark cold vs prefix-cached TTFA, RTF, stalls & RAM")
     bench_p.add_argument("--voice", required=True, help="Voice ID or path to .a8voice")
     bench_p.add_argument(
         "--text",
@@ -139,6 +139,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Test utterance text",
     )
     bench_p.add_argument("--runs", type=int, default=3, help="Number of runs (run 1 is cold)")
+    bench_p.add_argument("--provider", default=None, help="Override ONNX provider (cpu/cuda/dml/coreml/auto)")
+    bench_p.add_argument("--threads", type=int, default=None, help="Override total CPU thread budget")
+    bench_p.add_argument("--ar-threads", type=int, default=None, help="Override Slow/Fast AR thread count")
+    bench_p.add_argument("--codec-threads", type=int, default=None, help="Override Codec decoder thread count")
+    bench_p.add_argument("--first-chunk-frames", type=int, default=None, help="Override first chunk frames")
+    bench_p.add_argument("--chunk-frames", type=int, default=None, help="Override steady-state chunk frames")
+    bench_p.add_argument("--context-frames", type=int, default=None, help="Override stream context frames")
+    bench_p.add_argument(
+        "--no-pipeline",
+        action="store_true",
+        help="Disable concurrent AR+Codec pipelining (for serial A/B comparison)",
+    )
+    bench_p.add_argument("--json", action="store_true", dest="as_json", help="Output JSON report")
 
     # --- live ---
     live_p = sub.add_parser("live", help="Run local real-time microphone -> target voice passthrough")
@@ -386,19 +399,113 @@ def _cmd_synth(args: argparse.Namespace, cfg: AppConfig) -> int:
 
 
 def _cmd_benchmark(args: argparse.Namespace, cfg: AppConfig) -> int:
+    rt_cfg = cfg.runtime.model_copy(deep=True)
+    if args.provider is not None:
+        rt_cfg.provider = args.provider
+    if args.threads is not None:
+        rt_cfg.threads = args.threads
+    if args.ar_threads is not None:
+        rt_cfg.ar_threads = args.ar_threads
+    if args.codec_threads is not None:
+        rt_cfg.codec_threads = args.codec_threads
+    if args.first_chunk_frames is not None:
+        rt_cfg.first_chunk_frames = args.first_chunk_frames
+    if args.chunk_frames is not None:
+        rt_cfg.chunk_frames = args.chunk_frames
+    if args.context_frames is not None:
+        rt_cfg.stream_context_frames = args.context_frames
+    if args.no_pipeline:
+        rt_cfg.pipeline_decode = False
+
     lib = VoiceLibrary(cfg.paths.voices_dir)
     pack = lib.load(args.voice)
-    rt = Audio8OnnxRuntime(cfg.paths.model_dir, cfg.runtime)
-    print(f"Benchmarking voice={pack.voice_id} ({pack.manifest.num_frames} ref frames) runs={args.runs}")
+    rt = Audio8OnnxRuntime(cfg.paths.model_dir, rt_cfg)
+
+    runs_data: list[dict[str, Any]] = []
+    if not args.as_json:
+        print(
+            f"Benchmarking voice={pack.voice_id} ({pack.manifest.num_frames} ref frames) "
+            f"runs={args.runs} provider={rt.active_provider}"
+        )
+        print(
+            f"  Plan: ar_threads={rt.ar_threads} codec_threads={rt.codec_threads} "
+            f"pipeline={rt.cfg.pipeline_decode} first_chunk={rt.cfg.first_chunk_frames} "
+            f"chunk={rt.cfg.chunk_frames} ctx={rt.cfg.stream_context_frames} "
+            f"iob=({rt._slow_iobs is not None}/{rt._fast_iob is not None})"
+        )
     for i in range(1, max(1, args.runs) + 1):
         _, m = rt.synthesize(args.text, pack, seed=42 + i)
+        rss = get_process_rss_mb()
         label = "cold" if not m.cache_hit else "cached"
-        print(
-            f"  Run {i} [{label:<6}]: prefill={m.prefill_ms:>7.1f}ms  ttfa={m.ttfa_ms:>7.1f}ms  "
-            f"total={m.total_ms:>7.1f}ms  audio={m.audio_seconds:>5.2f}s  RTF={m.rtf:.3f}  "
-            f"RSS={get_process_rss_mb():.1f}MB"
+        runs_data.append(
+            {
+                "run": i,
+                "mode": label,
+                "cache_hit": m.cache_hit,
+                "num_frames": m.num_frames,
+                "num_chunks": m.num_chunks,
+                "audio_seconds": m.audio_seconds,
+                "prefill_ms": m.prefill_ms,
+                "ttfa_ms": m.ttfa_ms,
+                "total_ms": m.total_ms,
+                "rtf": m.rtf,
+                "total_stall_ms": m.total_stall_ms,
+                "max_stall_ms": m.max_stall_ms,
+                "rss_mb": rss,
+            }
         )
-    print(f"Prefix cache: {rt.cache_stats()}")
+        if not args.as_json:
+            print(
+                f"  Run {i} [{label:<6}]: prefill={m.prefill_ms:>7.1f}ms  ttfa={m.ttfa_ms:>7.1f}ms  "
+                f"total={m.total_ms:>7.1f}ms  audio={m.audio_seconds:>5.2f}s  RTF={m.rtf:.3f}  "
+                f"chunks={m.num_chunks:<2}  stall={m.total_stall_ms:>6.1f}ms (max {m.max_stall_ms:.1f})  "
+                f"RSS={rss:.1f}MB"
+            )
+
+    warm_runs = [r for r in runs_data if r["cache_hit"]]
+    summary: dict[str, Any] = {}
+    if warm_runs:
+        summary = {
+            "warm_runs": len(warm_runs),
+            "avg_prefill_ms": round(sum(r["prefill_ms"] for r in warm_runs) / len(warm_runs), 2),
+            "avg_ttfa_ms": round(sum(r["ttfa_ms"] for r in warm_runs) / len(warm_runs), 2),
+            "avg_total_ms": round(sum(r["total_ms"] for r in warm_runs) / len(warm_runs), 2),
+            "avg_rtf": round(sum(r["rtf"] for r in warm_runs) / len(warm_runs), 3),
+            "avg_total_stall_ms": round(
+                sum(r["total_stall_ms"] for r in warm_runs) / len(warm_runs), 2
+            ),
+        }
+
+    report = {
+        "voice_id": pack.voice_id,
+        "ref_frames": pack.manifest.num_frames,
+        "text": args.text,
+        "active_provider": rt.active_provider,
+        "session_providers": rt.session_providers,
+        "plan": {
+            "ar_threads": rt.ar_threads,
+            "codec_threads": rt.codec_threads,
+            "pipeline_decode": rt.cfg.pipeline_decode,
+            "first_chunk_frames": rt.cfg.first_chunk_frames,
+            "chunk_frames": rt.cfg.chunk_frames,
+            "stream_context_frames": rt.cfg.stream_context_frames,
+            "iobinding_slow": rt._slow_iobs is not None,
+            "iobinding_fast": rt._fast_iob is not None,
+        },
+        "runs": runs_data,
+        "warm_summary": summary,
+        "prefix_cache": rt.cache_stats(),
+    }
+    if args.as_json:
+        _print_json(report)
+    else:
+        if summary:
+            print(
+                f"  Warm avg ({summary['warm_runs']} runs): "
+                f"prefill={summary['avg_prefill_ms']:.1f}ms  ttfa={summary['avg_ttfa_ms']:.1f}ms  "
+                f"RTF={summary['avg_rtf']:.3f}  stall={summary['avg_total_stall_ms']:.1f}ms"
+            )
+        print(f"Prefix cache: {report['prefix_cache']}")
     rt.close()
     return 0
 
