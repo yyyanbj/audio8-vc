@@ -10,23 +10,27 @@ vad_model_path = "models/vad/silero_vad.onnx"
 [runtime]
 # ONNX Execution Provider: "cpu" | "cuda" | "coreml" | "dml" | "auto"
 provider = "cpu"
-# 总 CPU 线程预算，0 表示自动按物理核心拆分 AR / Codec 独立线程池（避免抢占与过载）
+# 总 CPU 线程预算，0 表示自动按物理核心 sizing（启用共享全局线程池避免多池空转抢占）
 threads = 0
-# Slow/Fast AR 独立线程数（0 表示自动 2~3 线程，INT8 单步 AR 最佳低延迟区间）
+# Slow/Fast AR 独立线程数（0 表示自动共享全局线程池；显式 >0 则切换每会话独立线程池）
 ar_threads = 0
-# Codec 解码器独立线程数（0 表示自动分配剩余物理核心；GPU 模式下仅用于 CPU 回退）
+# Codec 解码器独立线程数（0 表示自动共享全局线程池；GPU 模式下仅用于 CPU 回退）
 codec_threads = 0
+# 启用进程级共享 ONNX Runtime 线程池（Slow/Fast AR 与 Codec 动态工作窃取，最大化最小延迟与吞吐）
+use_global_thread_pool = true
 precision = "int8"
 codec_precision = "fp16"
 # 内存级 LRU 前缀状态缓存容量（每条约 10~12 MB，显著降低重复 prefill 延迟）
 prefix_cache_size = 4
-# 首包触发帧数（4 帧 ≈ 186ms，含 1 帧 guard 立即输出 ~139ms，极大压缩首字延迟 TTFA）
-first_chunk_frames = 4
-# 稳态流式解码块大小（帧，21.53 fps；8 帧 ≈ 372ms）
-chunk_frames = 8
-# 滑窗解码上下文帧数（配合零延迟 guard 重叠淡变，最小化 CPU 解码耗时同时消除接缝爆音）
-stream_context_frames = 8
-stream_guard_frames = 1
+# Slow-AR KV-Cache 零损耗压缩长度（2048 -> 512，输出逐比特等价，4x 减少无效 KV 拷贝，超长句自动无感扩展回 2048）
+slow_kv_max_seq_len = 512
+# 首包触发帧数（2 帧 ≈ 93ms，配合 256 采样 5.8ms 极短重叠淡变与 2->4->8->12 渐进升块，极致压缩首字延迟 TTFA）
+first_chunk_frames = 2
+# 稳态流式解码块大小（帧，21.53 fps；从首包 2 帧翻倍渐进至 12 帧，消除稳态卡顿并最小化 CPU RTF）
+chunk_frames = 12
+# 滑窗解码上下文帧数（4 帧上下文 + 5.8ms 升余弦重叠淡变，极速 CPU 解码同时无接缝爆音）
+stream_context_frames = 4
+stream_guard_frames = 0
 # 启用 AR 生成与 Codec 解码双线程流水线并行，隐藏解码延迟
 pipeline_decode = true
 # 采样参数

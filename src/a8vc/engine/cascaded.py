@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -93,6 +94,7 @@ class CascadedVCEngine(VoiceConversionEngine):
         self._edge_fade_samples = int(round((crossfade_ms / 1000.0) * synthesizer.sample_rate))
         self._voice: VoicePack | None = None
         self._voice_lock = threading.Lock()
+        self._asr_lock = threading.Lock()
         self._cancel_event = threading.Event()
 
         self._segments_processed = 0
@@ -127,15 +129,30 @@ class CascadedVCEngine(VoiceConversionEngine):
         self._cancel_event.clear()
         self._segmenter.reset()
 
-    def _convert_segment(self, segment: SpeechSegment) -> Iterator[VCOutputEvent]:
+    def transcribe_segment(self, segment: SpeechSegment) -> tuple[str, float]:
+        """Thread-safely transcribe a speech segment and return `(text, elapsed_ms)`."""
+        t_asr = time.perf_counter()
+        with self._asr_lock:
+            transcript = self._asr.transcribe(
+                segment.audio, sample_rate=segment.sample_rate
+            ).strip()
+        return transcript, (time.perf_counter() - t_asr) * 1000.0
+
+    def _convert_segment(
+        self,
+        segment: SpeechSegment,
+        *,
+        precomputed_asr: tuple[str, float] | None = None,
+    ) -> Iterator[VCOutputEvent]:
         voice = self.active_voice
         if voice is None:
             raise RuntimeError("No active voice selected. Call `set_voice(voice_pack)` first.")
 
         self._cancel_event.clear()
-        t_asr = time.perf_counter()
-        transcript = self._asr.transcribe(segment.audio, sample_rate=segment.sample_rate).strip()
-        asr_ms = (time.perf_counter() - t_asr) * 1000.0
+        if precomputed_asr is not None:
+            transcript, asr_ms = precomputed_asr
+        else:
+            transcript, asr_ms = self.transcribe_segment(segment)
         self._last_asr_ms = asr_ms
         if not transcript:
             return
@@ -248,6 +265,17 @@ class RealtimeVCWorker:
         self._error_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
+        # Speculative ASR state: runs SenseVoice during VAD trailing silence ONLY while the
+        # synthesis worker is idle, hiding ~40-70ms of ASR latency behind VAD endpointing
+        # with zero CPU contention during active Audio8 inference.
+        self._synth_busy = threading.Event()
+        self._spec_lock = threading.Lock()
+        self._spec_key: tuple[int, int] | None = None
+        self._spec_done = threading.Event()
+        self._spec_transcript: str | None = None
+        self._spec_executor: ThreadPoolExecutor | None = None
+        self._spec_hits = 0
+
     def _report_error(self, exc: Exception, *, context: str) -> None:
         msg = f"{type(exc).__name__}: {exc}"
         now = time.monotonic()
@@ -270,12 +298,76 @@ class RealtimeVCWorker:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        if self._spec_executor is None:
+            self._spec_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="a8vc-spec-asr",
+            )
         self._thread = threading.Thread(
             target=self._run_loop,
             name="a8vc-realtime-worker",
             daemon=True,
         )
         self._thread.start()
+
+    def _run_speculative_asr(self, candidate: SpeechSegment, done_evt: threading.Event) -> None:
+        try:
+            if self._stop_event.is_set() or self._synth_busy.is_set():
+                return
+            transcript, _ = self.engine.transcribe_segment(candidate)
+            with self._spec_lock:
+                if self._spec_key == candidate.spec_key:
+                    self._spec_transcript = transcript
+        except Exception:
+            logger.debug("Speculative ASR skipped due to exception", exc_info=True)
+        finally:
+            done_evt.set()
+
+    def _maybe_schedule_speculative_asr(self) -> None:
+        if (
+            self._stop_event.is_set()
+            or self._synth_busy.is_set()
+            or self._spec_executor is None
+            or self.engine.active_voice is None
+        ):
+            return
+        peek_fn = getattr(self.engine._segmenter, "peek_speculative_segment", None)
+        if not callable(peek_fn):
+            return
+        candidate = peek_fn()
+        if candidate is None or candidate.spec_key is None:
+            return
+        with self._spec_lock:
+            if self._spec_key == candidate.spec_key:
+                return
+            done_evt = threading.Event()
+            self._spec_key = candidate.spec_key
+            self._spec_transcript = None
+            self._spec_done = done_evt
+        try:
+            self._spec_executor.submit(self._run_speculative_asr, candidate, done_evt)
+        except RuntimeError:
+            done_evt.set()
+
+    def _consume_speculative_asr(self, seg: SpeechSegment) -> tuple[str, float] | None:
+        if seg.spec_key is None:
+            return None
+        with self._spec_lock:
+            if self._spec_key != seg.spec_key:
+                return None
+            done_evt = self._spec_done
+        t_wait = time.perf_counter()
+        if not done_evt.wait(timeout=2.0):
+            return None
+        wait_ms = (time.perf_counter() - t_wait) * 1000.0
+        with self._spec_lock:
+            if self._spec_key != seg.spec_key or self._spec_transcript is None:
+                return None
+            transcript = self._spec_transcript
+            self._spec_key = None
+            self._spec_transcript = None
+        self._spec_hits += 1
+        return transcript, wait_ms
 
     def submit_audio(self, audio: np.ndarray, sample_rate: int) -> None:
         try:
@@ -284,8 +376,11 @@ class RealtimeVCWorker:
                 return
             if sample_rate != self.engine._segmenter.sample_rate:
                 mono = resample_audio(mono, sample_rate, self.engine._segmenter.sample_rate)
-            for seg in self.engine._segmenter.feed(mono):
+            segments = self.engine._segmenter.feed(mono)
+            for seg in segments:
                 self._enqueue_segment(seg)
+            if not segments:
+                self._maybe_schedule_speculative_asr()
         except Exception as exc:
             self._report_error(exc, context="submit_audio")
 
@@ -316,13 +411,21 @@ class RealtimeVCWorker:
             if seg is None:
                 break
             try:
-                for event in self.engine._convert_segment(seg):
+                precomputed = self._consume_speculative_asr(seg)
+                self._synth_busy.set()
+                for event in self.engine._convert_segment(seg, precomputed_asr=precomputed):
                     if self._stop_event.is_set():
                         break
                     self._on_event(event)
             except Exception as exc:
                 self._report_error(exc, context="convert_segment")
                 continue
+            finally:
+                self._synth_busy.clear()
+
+    @property
+    def speculative_asr_hits(self) -> int:
+        return self._spec_hits
 
     @property
     def dropped_segments(self) -> int:
@@ -345,3 +448,6 @@ class RealtimeVCWorker:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self._spec_executor is not None:
+            self._spec_executor.shutdown(wait=False, cancel_futures=True)
+            self._spec_executor = None

@@ -30,13 +30,15 @@ class RuntimeConfig(BaseModel):
     threads: int = Field(default=0, ge=0)
     ar_threads: int = Field(default=0, ge=0)
     codec_threads: int = Field(default=0, ge=0)
+    use_global_thread_pool: bool = True
     precision: str = "int8"
     codec_precision: str = "fp16"
     prefix_cache_size: int = Field(default=4, ge=0, le=32)
-    first_chunk_frames: int = Field(default=4, ge=2, le=32)
-    chunk_frames: int = Field(default=8, ge=2, le=64)
-    stream_context_frames: int = Field(default=8, ge=4, le=256)
-    stream_guard_frames: int = Field(default=1, ge=0, le=8)
+    slow_kv_max_seq_len: int = Field(default=512, ge=0, le=2048)
+    first_chunk_frames: int = Field(default=2, ge=2, le=32)
+    chunk_frames: int = Field(default=12, ge=2, le=64)
+    stream_context_frames: int = Field(default=4, ge=4, le=256)
+    stream_guard_frames: int = Field(default=0, ge=0, le=8)
     pipeline_decode: bool = True
     temperature: float = Field(default=0.7, gt=0.0, le=2.0)
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
@@ -114,9 +116,12 @@ def _env_overrides() -> dict[str, Any]:
         "A8VC_THREADS": ("runtime", "threads"),
         "A8VC_AR_THREADS": ("runtime", "ar_threads"),
         "A8VC_CODEC_THREADS": ("runtime", "codec_threads"),
+        "A8VC_GLOBAL_THREAD_POOL": ("runtime", "use_global_thread_pool"),
+        "A8VC_SLOW_KV_MAX_SEQ_LEN": ("runtime", "slow_kv_max_seq_len"),
         "A8VC_FIRST_CHUNK_FRAMES": ("runtime", "first_chunk_frames"),
         "A8VC_CHUNK_FRAMES": ("runtime", "chunk_frames"),
         "A8VC_STREAM_CONTEXT_FRAMES": ("runtime", "stream_context_frames"),
+        "A8VC_STREAM_GUARD_FRAMES": ("runtime", "stream_guard_frames"),
         "A8VC_PIPELINE_DECODE": ("runtime", "pipeline_decode"),
         "A8VC_ASR_BACKEND": ("asr", "backend"),
         "A8VC_ENGINE_MODE": ("engine", "mode"),

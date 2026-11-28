@@ -18,12 +18,15 @@ from a8vc.runtime.manifest import RuntimeManifest, load_runtime_manifest
 from a8vc.runtime.prefix_cache import PrefixStateCache, PrefixStateSnapshot
 from a8vc.runtime.prompt import PromptBuilder
 from a8vc.runtime.providers import (
+    compute_global_pool_threads,
     compute_thread_plan,
     create_onnx_session,
+    is_global_thread_pool_enabled,
     resolve_providers,
     select_model_provider,
 )
 from a8vc.runtime.sampling import sample_codebook, sample_semantic
+from a8vc.runtime.slow_ar_kv import prepare_compact_slow_ar_model
 from a8vc.voices.format import VoicePack
 
 logger = logging.getLogger("a8vc.runtime.audio8_onnx")
@@ -179,31 +182,65 @@ class Audio8OnnxRuntime:
         )
 
         # Determine whether codec_decoder will execute on GPU so CPU AR & Codec
-        # thread pools can be partitioned without oversubscribing physical cores.
+        # thread pools can be sized without oversubscribing physical cores.
         try:
             dec_resolved = resolve_providers(dec_req)
             codec_expected_gpu = bool(dec_resolved and dec_resolved[0] != "CPUExecutionProvider")
         except Exception:
             codec_expected_gpu = False
 
-        self.ar_threads, self.codec_threads, self.threads = compute_thread_plan(
-            threads=self.cfg.threads,
-            ar_threads=self.cfg.ar_threads,
-            codec_threads=self.cfg.codec_threads,
-            codec_on_gpu=codec_expected_gpu,
-            pipeline_decode=self.cfg.pipeline_decode,
+        want_global_pool = bool(
+            (
+                self.cfg.use_global_thread_pool
+                and self.cfg.ar_threads == 0
+                and self.cfg.codec_threads == 0
+            )
+            or is_global_thread_pool_enabled()
         )
-        # Fast-AR executes tiny 1-token acoustic codebook steps strictly sequentially
-        # inside the AR worker. Running it with 1 thread and allow_spinning=False avoids
-        # spawning an idle busy-spinning thread pool that starves Slow-AR and Codec.
-        self.fast_threads = 1
+        if want_global_pool:
+            global_threads, self.threads = compute_global_pool_threads(
+                threads=self.cfg.threads,
+                codec_on_gpu=codec_expected_gpu,
+                pipeline_decode=self.cfg.pipeline_decode,
+            )
+            self.use_global_thread_pool = True
+            self.global_pool_threads: int | None = global_threads
+            self.ar_threads = global_threads
+            self.codec_threads = 2 if codec_expected_gpu else global_threads
+            self.fast_threads = global_threads
+            fast_spin = True
+        else:
+            self.ar_threads, self.codec_threads, self.threads = compute_thread_plan(
+                threads=self.cfg.threads,
+                ar_threads=self.cfg.ar_threads,
+                codec_threads=self.cfg.codec_threads,
+                codec_on_gpu=codec_expected_gpu,
+                pipeline_decode=self.cfg.pipeline_decode,
+            )
+            self.use_global_thread_pool = False
+            self.global_pool_threads = None
+            # Per-session mode: Fast-AR executes tiny 1-token steps strictly sequentially
+            # inside the AR worker. Running it with 1 thread and allow_spinning=False avoids
+            # spawning an idle busy-spinning thread pool that starves Slow-AR and Codec.
+            self.fast_threads = 1
+            fast_spin = False
+
+        # Bit-exact Slow-AR KV-cache compaction (2048 -> 512) cuts KV copy/mask overhead 4x
+        # while seamlessly auto-expanding back to manifest.max_seq_len on long prompts.
+        self._slow_model_path_active, self._active_max_seq_len = prepare_compact_slow_ar_model(
+            self.manifest.slow_model_path,
+            target_seq_len=self.cfg.slow_kv_max_seq_len,
+            orig_seq_len=self.manifest.max_seq_len,
+        )
 
         self._slow, slow_ep, slow_warn = create_onnx_session(
-            self.manifest.slow_model_path,
+            self._slow_model_path_active,
             provider=slow_req,
             threads=self.ar_threads,
             inter_op_threads=1,
             allow_spinning=True,
+            use_global_pool=self.use_global_thread_pool,
+            global_pool_threads=self.global_pool_threads,
         )
 
         # If slow_ar attempted GPU and failed, avoid repeating identical GPU init failure on fast_ar
@@ -214,7 +251,8 @@ class Audio8OnnxRuntime:
             provider=fast_req,
             threads=self.fast_threads,
             inter_op_threads=1,
-            allow_spinning=False,
+            allow_spinning=fast_spin,
+            use_global_pool=self.use_global_thread_pool,
         )
 
         if slow_warn is not None and slow_ep == "CPUExecutionProvider" and slow_note is None:
@@ -225,6 +263,7 @@ class Audio8OnnxRuntime:
             threads=self.codec_threads,
             inter_op_threads=1,
             allow_spinning=True,
+            use_global_pool=self.use_global_thread_pool,
         )
 
         self.session_providers: dict[str, str] = {
@@ -266,7 +305,7 @@ class Audio8OnnxRuntime:
             np.zeros_like(self._workspace["ssm_states"]),
         ]
         self._slow_state_idx = 0
-        self._dirty_seq_len = self.manifest.max_seq_len
+        self._dirty_seq_len = self._active_max_seq_len
 
         # Reusable Fast-AR buffers avoid per-frame allocations
         self._fast_caches = self._allocate_fast_caches()
@@ -278,6 +317,10 @@ class Audio8OnnxRuntime:
     def sample_rate(self) -> int:
         return self.manifest.sample_rate
 
+    @property
+    def active_max_seq_len(self) -> int:
+        return self._active_max_seq_len
+
     def _validate_and_inspect_contract(self) -> None:
         slow_in = {inp.name: inp for inp in self._slow.get_inputs()}
         slow_out = {out.name: out for out in self._slow.get_outputs()}
@@ -287,6 +330,9 @@ class Audio8OnnxRuntime:
             raise RuntimeError(f"Unexpected slow_ar outputs: {sorted(slow_out.keys())}")
 
         self._slow_dtypes = {name: _ort_type_to_numpy(inp.type) for name, inp in slow_in.items()}
+        ck_shape = slow_in["cache_keys"].shape
+        if len(ck_shape) == 5 and isinstance(ck_shape[3], int) and ck_shape[3] > 0:
+            self._active_max_seq_len = int(ck_shape[3])
         conv_shape = slow_in["conv_states"].shape
         if len(conv_shape) == 4 and isinstance(conv_shape[2], int):
             self._conv_channels = conv_shape[2]
@@ -317,13 +363,14 @@ class Audio8OnnxRuntime:
 
     def _allocate_slow_state(self) -> dict[str, np.ndarray]:
         m = self.manifest
+        seq_len = self._active_max_seq_len
         return {
             "cache_keys": np.zeros(
-                (m.num_layers, 1, m.n_local_heads, m.max_seq_len, m.head_dim),
+                (m.num_layers, 1, m.n_local_heads, seq_len, m.head_dim),
                 dtype=self._slow_dtypes["cache_keys"],
             ),
             "cache_values": np.zeros(
-                (m.num_layers, 1, m.n_local_heads, m.max_seq_len, m.head_dim),
+                (m.num_layers, 1, m.n_local_heads, seq_len, m.head_dim),
                 dtype=self._slow_dtypes["cache_values"],
             ),
             "conv_states": np.zeros(
@@ -337,12 +384,53 @@ class Audio8OnnxRuntime:
         }
 
     def _zero_workspace(self) -> None:
-        end = min(self.manifest.max_seq_len, self._dirty_seq_len)
+        end = min(self._active_max_seq_len, self._dirty_seq_len)
         self._workspace["cache_keys"][:, :, :, :end, :] = 0
         self._workspace["cache_values"][:, :, :, :end, :] = 0
         self._workspace["conv_states"].fill(0)
         self._workspace["ssm_states"].fill(0)
         self._dirty_seq_len = 0
+
+    def _expand_slow_ar_to_full_context(self) -> bool:
+        """Seamlessly reload original full-context `slow_ar` if a long voice/prompt exceeds compact KV."""
+        if (
+            self._active_max_seq_len >= self.manifest.max_seq_len
+            or self._slow_model_path_active == self.manifest.slow_model_path
+        ):
+            return False
+
+        logger.info(
+            "Expanding Slow-AR KV-cache from %d to full manifest max_seq_len=%d for long context",
+            self._active_max_seq_len,
+            self.manifest.max_seq_len,
+        )
+        slow_req = "cpu" if self.session_providers.get("slow_ar") == "CPUExecutionProvider" else self.cfg.provider
+        full_sess, full_ep, _ = create_onnx_session(
+            self.manifest.slow_model_path,
+            provider=slow_req,
+            threads=self.ar_threads,
+            inter_op_threads=1,
+            allow_spinning=True,
+            use_global_pool=self.use_global_thread_pool,
+        )
+        self._slow = full_sess
+        self._slow_model_path_active = self.manifest.slow_model_path
+        self.session_providers["slow_ar"] = full_ep
+        self._active_max_seq_len = self.manifest.max_seq_len
+        self._validate_and_inspect_contract()
+        self._workspace = self._allocate_slow_state()
+        self._conv_pair = [
+            self._workspace["conv_states"],
+            np.zeros_like(self._workspace["conv_states"]),
+        ]
+        self._ssm_pair = [
+            self._workspace["ssm_states"],
+            np.zeros_like(self._workspace["ssm_states"]),
+        ]
+        self._slow_state_idx = 0
+        self._dirty_seq_len = self._active_max_seq_len
+        self._init_iobinding()
+        return True
 
     def _allocate_fast_caches(self) -> dict[str, np.ndarray]:
         m = self.manifest
@@ -520,7 +608,7 @@ class Audio8OnnxRuntime:
         """Rebuild a failing GPU ONNX session on CPU so runtime kernel errors never crash synthesis."""
         prev_ep = self.session_providers.get(role, "CPUExecutionProvider")
         path_map = {
-            "slow_ar": self.manifest.slow_model_path,
+            "slow_ar": self._slow_model_path_active,
             "fast_ar": self.manifest.fast_model_path,
             "codec_decoder": self.manifest.codec_decoder_path,
         }
@@ -534,7 +622,7 @@ class Audio8OnnxRuntime:
             role_spin = True
         elif role == "fast_ar":
             role_threads = self.fast_threads
-            role_spin = False
+            role_spin = self.use_global_thread_pool
         else:
             role_threads = self.ar_threads
             role_spin = True
@@ -549,6 +637,7 @@ class Audio8OnnxRuntime:
             threads=role_threads,
             inter_op_threads=1,
             allow_spinning=role_spin,
+            use_global_pool=self.use_global_thread_pool,
         )
         setattr(self, attr_map[role], cpu_sess)
         self.session_providers[role] = "CPUExecutionProvider"
@@ -719,10 +808,12 @@ class Audio8OnnxRuntime:
             voice.manifest.reference_text, voice.codes
         )
         prefix_len = int(sys_prompt.shape[2])
-        if prefix_len >= self.manifest.max_seq_len - 16:
+        if prefix_len >= self._active_max_seq_len - 96 and self._active_max_seq_len < self.manifest.max_seq_len:
+            self._expand_slow_ar_to_full_context()
+        if prefix_len >= self._active_max_seq_len - 16:
             raise ValueError(
                 f"Voice {voice.voice_id!r} reference prefix ({prefix_len} tokens) is too long "
-                f"for max_seq_len={self.manifest.max_seq_len}; trim reference audio to <=15s."
+                f"for max_seq_len={self._active_max_seq_len}; trim reference audio to <=15s."
             )
 
         self._zero_workspace()
@@ -806,6 +897,9 @@ class Audio8OnnxRuntime:
         guard_frames = self.cfg.stream_guard_frames
         hop = self.manifest.codec_hop_length
         guard_samples = guard_frames * hop
+        # Always hold back at least `_GUARD_FADE_SAMPLES` (5.8 ms) on non-final chunks so
+        # even `stream_guard_frames=0` performs click-free raised-cosine boundary crossfading.
+        holdback_samples = max(guard_samples, _GUARD_FADE_SAMPLES)
         rng = np.random.default_rng(seed)
 
         user_prompt = self.prompt_builder.build_user_suffix(text)
@@ -830,7 +924,12 @@ class Audio8OnnxRuntime:
                 self._decoder_warmed = True
                 abs_start = start_frame * hop
                 if not is_final:
-                    stable_end = abs_start + max(0, decoded.size - guard_samples)
+                    eff_holdback = (
+                        holdback_samples
+                        if decoded.size > holdback_samples
+                        else min(holdback_samples, decoded.size // 4)
+                    )
+                    stable_end = abs_start + max(0, decoded.size - eff_holdback)
                     begin = max(0, emitted_samples - abs_start)
                     end = max(begin, stable_end - abs_start)
                 else:
@@ -892,11 +991,19 @@ class Audio8OnnxRuntime:
                 local_cancel: threading.Event | None = None,
             ) -> Iterator[tuple[np.ndarray, int, int, float, bool, bool]]:
                 prefix_len, cache_hit = self._prepare_voice_prefix(voice)
-                max_avail = self.manifest.max_seq_len - (prefix_len + user_len)
+                min_gen_headroom = min(int(max_steps), 96)
+                if (
+                    prefix_len + user_len + min_gen_headroom > self._active_max_seq_len
+                    and self._active_max_seq_len < self.manifest.max_seq_len
+                ):
+                    if self._expand_slow_ar_to_full_context():
+                        prefix_len, cache_hit = self._prepare_voice_prefix(voice)
+
+                max_avail = self._active_max_seq_len - (prefix_len + user_len)
                 if max_avail <= 1:
                     raise ValueError(
                         f"Prompt length ({prefix_len + user_len}) leaves no generation room "
-                        f"in max_seq_len={self.manifest.max_seq_len}"
+                        f"in max_seq_len={self._active_max_seq_len}"
                     )
                 step_budget = min(int(max_steps), max_avail)
 
@@ -917,7 +1024,8 @@ class Audio8OnnxRuntime:
                 frames: list[np.ndarray] = []
                 semantic_history: list[int] = []
                 eos_index = self.manifest.codebook_size
-                next_emit = first_emit
+                cur_step = first_emit
+                next_emit = cur_step
                 last_emit_nf = 0
                 column = np.empty((1, self.manifest.num_codebooks + 1, 1), dtype=np.int64)
 
@@ -949,20 +1057,22 @@ class Audio8OnnxRuntime:
                     )
                     frames.append(frame)
 
-                    # Dispatch completed chunk to Codec BEFORE next Slow-AR step (~25 ms head-start)
+                    # Dispatch completed chunk to Codec BEFORE next Slow-AR step (~20 ms head-start),
+                    # progressively doubling chunk size (`2 -> 4 -> 8 -> 12`) to minimize both TTFA and stalls.
                     if len(frames) == next_emit:
                         step_sz = len(frames) - last_emit_nf
                         start_frame = max(0, len(frames) - context_frames - step_sz)
                         window = np.stack(frames[start_frame:], axis=1)
                         yield (window, start_frame, len(frames), prefill_ms, cache_hit, False)
                         last_emit_nf = len(frames)
-                        next_emit += emit_every
+                        cur_step = min(emit_every, cur_step * 2)
+                        next_emit += cur_step
                         if _is_cancelled(local_cancel):
                             return
 
                     # Feed completed frame back into Slow-AR for next frame prediction
                     next_pos = prompt_len + step
-                    if step + 1 < step_budget and next_pos < self.manifest.max_seq_len:
+                    if step + 1 < step_budget and next_pos < self._active_max_seq_len:
                         column[0, 0, 0] = semantic_token
                         column[0, 1:, 0] = frame
                         logits, hidden = self._slow_step(column, next_pos, self._workspace)

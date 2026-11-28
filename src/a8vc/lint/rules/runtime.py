@@ -235,6 +235,8 @@ def check_low_latency_runtime_invariants(ctx: LintContext) -> list[LintFinding]:
     if prov_text is not None:
         for token, msg in (
             ("def compute_thread_plan", "providers.py is missing `compute_thread_plan` AR/Codec thread partitioning."),
+            ("def ensure_global_thread_pool", "providers.py is missing `ensure_global_thread_pool` shared ORT thread pool setup."),
+            ("use_per_session_threads", "providers.py must set `use_per_session_threads = False` when global thread pool is active."),
             ("inter_op_num_threads", "providers.py must explicitly configure `inter_op_num_threads`."),
             ("session.intra_op.allow_spinning", "providers.py must enable `session.intra_op.allow_spinning` for low-latency steps."),
             ("CUDAExecutionProvider", "providers.py must route dynamic-INT8 AR to CPU when CUDAExecutionProvider is active."),
@@ -247,9 +249,11 @@ def check_low_latency_runtime_invariants(ctx: LintContext) -> list[LintFinding]:
     if rt_text is not None:
         for token, msg in (
             ("compute_thread_plan", "Audio8OnnxRuntime must partition AR/Codec threads via `compute_thread_plan`."),
+            ("prepare_compact_slow_ar_model", "Audio8OnnxRuntime must compact Slow-AR KV-cache via `prepare_compact_slow_ar_model`."),
             ("run_with_iobinding", "Audio8OnnxRuntime must support zero-copy CPU `run_with_iobinding` for AR."),
             ("first_chunk_frames", "Audio8OnnxRuntime must support progressive `first_chunk_frames` for minimal TTFA."),
             ("pipeline_decode", "Audio8OnnxRuntime must support concurrent AR+Codec `pipeline_decode`."),
+            ("holdback_samples", "Audio8OnnxRuntime must preserve 256-sample overlap crossfade holdback when stream_guard_frames=0."),
         ):
             if token not in rt_text:
                 findings.append(LintFinding(rule_id="RT004", path=rt_rel, message=msg))
@@ -271,12 +275,12 @@ def check_low_latency_runtime_invariants(ctx: LintContext) -> list[LintFinding]:
         rt_sec = data.get("runtime", {})
         if not isinstance(rt_sec, dict):
             rt_sec = {}
-        if int(rt_sec.get("first_chunk_frames", 99)) > 6:
+        if int(rt_sec.get("first_chunk_frames", 99)) > 4:
             findings.append(
                 LintFinding(
                     rule_id="RT004",
                     path=toml_rel,
-                    message="default.toml `runtime.first_chunk_frames` exceeds 6 frames (regresses TTFA).",
+                    message="default.toml `runtime.first_chunk_frames` exceeds 4 frames (regresses TTFA).",
                 )
             )
         if int(rt_sec.get("chunk_frames", 99)) > 12:
@@ -287,12 +291,12 @@ def check_low_latency_runtime_invariants(ctx: LintContext) -> list[LintFinding]:
                     message="default.toml `runtime.chunk_frames` exceeds 12 frames (regresses streaming latency).",
                 )
             )
-        if int(rt_sec.get("stream_context_frames", 999)) > 16:
+        if int(rt_sec.get("stream_context_frames", 999)) > 8:
             findings.append(
                 LintFinding(
                     rule_id="RT004",
                     path=toml_rel,
-                    message="default.toml `runtime.stream_context_frames` exceeds 16 frames (regresses CPU codec RTF).",
+                    message="default.toml `runtime.stream_context_frames` exceeds 8 frames (regresses CPU codec RTF).",
                 )
             )
         if rt_sec.get("pipeline_decode") is not True:
@@ -301,6 +305,23 @@ def check_low_latency_runtime_invariants(ctx: LintContext) -> list[LintFinding]:
                     rule_id="RT004",
                     path=toml_rel,
                     message="default.toml must keep `runtime.pipeline_decode = true` by default.",
+                )
+            )
+        if rt_sec.get("use_global_thread_pool") is not True:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message="default.toml must keep `runtime.use_global_thread_pool = true` by default.",
+                )
+            )
+        kv_len = int(rt_sec.get("slow_kv_max_seq_len", 0))
+        if kv_len <= 0 or kv_len > 1024:
+            findings.append(
+                LintFinding(
+                    rule_id="RT004",
+                    path=toml_rel,
+                    message="default.toml must enable `runtime.slow_kv_max_seq_len` (e.g. 512) to avoid 2048-slot KV overhead.",
                 )
             )
 

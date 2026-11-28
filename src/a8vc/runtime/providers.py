@@ -20,6 +20,9 @@ _PRELOAD_ATTEMPTED = False
 _REGISTERED_DLL_DIRS: set[str] = set()
 _DLL_DIR_HANDLES: list[Any] = []
 
+_GLOBAL_POOL_LOCK = threading.Lock()
+_GLOBAL_POOL_THREADS: int | None = None
+
 _PROVIDER_TO_EP = {
     "cpu": "CPUExecutionProvider",
     "cuda": "CUDAExecutionProvider",
@@ -89,6 +92,95 @@ def compute_thread_plan(
     eff_ar = max(1, int(ar_threads)) if ar_threads > 0 else auto_ar
     eff_codec = max(1, int(codec_threads)) if codec_threads > 0 else auto_codec
     return eff_ar, eff_codec, total
+
+
+def compute_global_pool_threads(
+    *,
+    threads: int = 0,
+    codec_on_gpu: bool = False,
+    pipeline_decode: bool = True,
+    cpu_count: int | None = None,
+) -> tuple[int, int]:
+    """Compute optimal process-global ORT intra-op pool size `(global_threads, total_budget)`.
+
+    Sharing one spinning global pool across Slow-AR, Fast-AR, and CPU Codec lets Slow-AR use
+    all pool workers during prefill (when Codec is idle), accelerates Fast-AR without spawning
+    an extra spinning pool, and lets pipelined AR+Codec dynamically work-steal. Because two
+    caller threads participate concurrently in pipelined CPU mode (adding 1 active thread beyond
+    the pool's `G - 1` workers), sizing `G` below the physical core budget prevents oversubscription
+    convoys (`G=6` on 8-core budget, `G=3` on 4-core budget).
+    """
+    detected = max(1, int(cpu_count if cpu_count is not None else (os.cpu_count() or 4)))
+    if threads > 0:
+        total = max(1, int(threads))
+    else:
+        total = max(2, min(8, detected // 2))
+
+    if codec_on_gpu or not pipeline_decode:
+        g = min(6, total) if threads == 0 else total
+    else:
+        if total >= 8:
+            g = total - 2
+        elif total >= 4:
+            g = total - 1
+        else:
+            g = total
+    return max(1, g), total
+
+
+def is_global_thread_pool_enabled() -> bool:
+    """Return True if ONNX Runtime's process-global thread pool has been initialized."""
+    return _GLOBAL_POOL_THREADS is not None
+
+
+def get_global_thread_pool_threads() -> int | None:
+    """Return the configured global ORT intra-op thread count, or None if per-session pools are used."""
+    return _GLOBAL_POOL_THREADS
+
+
+def ensure_global_thread_pool(
+    intra_threads: int,
+    inter_threads: int = 1,
+    *,
+    ort_module: Any = None,
+) -> int | None:
+    """Idempotently configure ONNX Runtime's process-global thread pool (once per process)."""
+    global _GLOBAL_POOL_THREADS
+
+    safe_intra = max(1, int(intra_threads))
+    safe_inter = max(1, int(inter_threads))
+
+    if ort_module is None:
+        with _GLOBAL_POOL_LOCK:
+            if _GLOBAL_POOL_THREADS is not None:
+                return _GLOBAL_POOL_THREADS
+            import onnxruntime as ort
+
+            set_pool = getattr(ort, "set_global_thread_pool_sizes", None)
+            if not callable(set_pool):
+                return None
+            try:
+                set_pool(safe_intra, safe_inter)
+            except Exception as exc:
+                if "already been created" in str(exc).lower():
+                    _GLOBAL_POOL_THREADS = safe_intra
+                    return _GLOBAL_POOL_THREADS
+                logger.debug("onnxruntime.set_global_thread_pool_sizes failed: %s", exc)
+                return None
+            _GLOBAL_POOL_THREADS = safe_intra
+            return _GLOBAL_POOL_THREADS
+
+    set_pool = getattr(ort_module, "set_global_thread_pool_sizes", None)
+    if not callable(set_pool):
+        return None
+    try:
+        set_pool(safe_intra, safe_inter)
+    except Exception as exc:
+        if "already been created" in str(exc).lower():
+            return safe_intra
+        logger.debug("set_global_thread_pool_sizes failed on custom ort_module: %s", exc)
+        return None
+    return safe_intra
 
 
 def select_model_provider(
@@ -302,13 +394,15 @@ def build_session_options(
     threads: int = 2,
     inter_op_threads: int = 1,
     allow_spinning: bool = True,
+    use_global_pool: bool | None = None,
     ort_module: Any = None,
 ) -> Any:
     """Create low-latency tuned ONNX Runtime `SessionOptions` for the selected providers.
 
     Uses sequential execution with `inter_op_num_threads=1`, denormal-as-zero, and
     active intra-op thread spinning to minimize per-token AR and codec latency.
-    Applies DirectML's required disabled memory-pattern setting when active.
+    Automatically binds `use_per_session_threads = False` whenever ORT's process-global
+    thread pool is active, and applies DirectML's disabled memory-pattern setting when needed.
     """
     ort = ort_module
     if ort is None:
@@ -318,10 +412,20 @@ def build_session_options(
     safe_inter = max(1, int(inter_op_threads))
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.intra_op_num_threads = safe_threads
-    opts.inter_op_num_threads = safe_inter
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.log_severity_level = 3
+
+    is_real_ort = ort_module is None or getattr(ort_module, "__name__", "") == "onnxruntime"
+    global_active = (
+        bool(use_global_pool)
+        if use_global_pool is not None
+        else (is_real_ort and _GLOBAL_POOL_THREADS is not None)
+    )
+    if global_active and hasattr(opts, "use_per_session_threads"):
+        opts.use_per_session_threads = False
+    else:
+        opts.intra_op_num_threads = safe_threads
+        opts.inter_op_num_threads = safe_inter
 
     add_cfg = getattr(opts, "add_session_config_entry", None)
     if callable(add_cfg):
@@ -357,6 +461,8 @@ def create_onnx_session(
     threads: int = 2,
     inter_op_threads: int = 1,
     allow_spinning: bool = True,
+    use_global_pool: bool | None = None,
+    global_pool_threads: int | None = None,
     ort_module: Any = None,
 ) -> tuple[Any, str, str | None]:
     """Create an ONNX Runtime `InferenceSession` with automatic safe CPU fallback.
@@ -370,6 +476,17 @@ def create_onnx_session(
     normalized = (provider or "cpu").strip().lower()
     if normalized in {"cuda", "auto"}:
         prepare_gpu_environment(normalized)
+
+    effective_global = use_global_pool
+    if use_global_pool is True and global_pool_threads is not None:
+        configured = ensure_global_thread_pool(
+            global_pool_threads,
+            inter_threads=inter_op_threads,
+            ort_module=ort_module,
+        )
+        effective_global = configured is not None
+    elif use_global_pool is None and ort_module is None and _GLOBAL_POOL_THREADS is not None:
+        effective_global = True
 
     available = list(ort.get_available_providers())
     providers = resolve_providers(normalized, available)
@@ -392,6 +509,7 @@ def create_onnx_session(
         threads=threads,
         inter_op_threads=inter_op_threads,
         allow_spinning=allow_spinning,
+        use_global_pool=effective_global,
         ort_module=ort,
     )
     try:
@@ -407,6 +525,7 @@ def create_onnx_session(
             threads=threads,
             inter_op_threads=inter_op_threads,
             allow_spinning=allow_spinning,
+            use_global_pool=effective_global,
             ort_module=ort,
         )
         session = ort.InferenceSession(

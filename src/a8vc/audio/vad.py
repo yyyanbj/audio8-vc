@@ -99,14 +99,19 @@ class SileroVADOnnx:
         else:
             import onnxruntime as ort
 
+            from a8vc.runtime.providers import build_session_options
+
             path = Path(model_path)
             if not path.is_file():
                 raise FileNotFoundError(f"Silero VAD model not found: {path}")
 
-            opts = ort.SessionOptions()
-            opts.intra_op_num_threads = 1
-            opts.inter_op_num_threads = 1
-            opts.log_severity_level = 3
+            opts = build_session_options(
+                ["CPUExecutionProvider"],
+                threads=1,
+                inter_op_threads=1,
+                allow_spinning=False,
+                ort_module=None,
+            )
             self._session = ort.InferenceSession(
                 str(path),
                 sess_options=opts,
@@ -224,6 +229,7 @@ class SpeechSegment:
     start_ms: float
     end_ms: float
     forced_cut: bool = False
+    spec_key: tuple[int, int] | None = None
 
     @property
     def duration_ms(self) -> float:
@@ -264,6 +270,7 @@ class SpeechSegmenter:
         self._silence_streak = 0
         self._total_frames = 0
         self._segment_start_frame = 0
+        self._last_spec_key: tuple[int, int] | None = None
 
     def reset(self) -> None:
         self.vad.reset()
@@ -275,6 +282,48 @@ class SpeechSegmenter:
         self._silence_streak = 0
         self._total_frames = 0
         self._segment_start_frame = 0
+        self._last_spec_key = None
+
+    def peek_speculative_segment(self, min_silence_frames: int = 2) -> SpeechSegment | None:
+        """Return an early, bit-identical trimmed speech snapshot during trailing VAD silence.
+
+        Because `_process_frame` trims trailing silence down to 2 frames upon endpointing, once
+        `_silence_streak >= 2` (with at least 2 confirmation silence frames remaining), the
+        trimmed waveform is already sample-for-sample identical to the finalized segment if
+        the speaker does not resume. Running ASR speculatively hides ASR latency behind VAD.
+        """
+        trigger = max(2, int(min_silence_frames))
+        if (
+            not self._in_speech
+            or self._silence_frames < trigger + 2
+            or self._silence_streak < trigger
+            or self._silence_streak >= self._silence_frames
+        ):
+            return None
+
+        trim = max(0, self._silence_streak - 2)
+        end_idx = len(self._active_frames) - trim if trim > 0 else len(self._active_frames)
+        if end_idx < self._min_frames:
+            return None
+
+        spec_key = (self._segment_start_frame, end_idx)
+        if spec_key == self._last_spec_key:
+            return None
+        self._last_spec_key = spec_key
+
+        audio = np.ascontiguousarray(
+            np.concatenate(self._active_frames[:end_idx]), dtype=np.float32
+        )
+        start_ms = self._segment_start_frame * self.frame_ms
+        end_ms = start_ms + (audio.size / self.sample_rate) * 1000.0
+        return SpeechSegment(
+            audio=audio,
+            sample_rate=self.sample_rate,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            forced_cut=False,
+            spec_key=spec_key,
+        )
 
     def feed(self, audio_chunk: np.ndarray) -> list[SpeechSegment]:
         """Push an arbitrary-length 16kHz float32 audio chunk and return completed segments."""
@@ -352,8 +401,10 @@ class SpeechSegmenter:
         self._in_speech = False
         self._speech_streak = 0
         self._silence_streak = 0
+        self._last_spec_key = None
 
     def _finalize_segment(self, forced_cut: bool) -> SpeechSegment:
+        spec_key = (self._segment_start_frame, len(self._active_frames))
         audio = np.ascontiguousarray(np.concatenate(self._active_frames), dtype=np.float32)
         start_ms = self._segment_start_frame * self.frame_ms
         end_ms = start_ms + (audio.size / self.sample_rate) * 1000.0
@@ -364,4 +415,5 @@ class SpeechSegmenter:
             start_ms=start_ms,
             end_ms=end_ms,
             forced_cut=forced_cut,
+            spec_key=spec_key,
         )

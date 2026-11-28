@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "audio8-vc"
-version = "0.2.3"
+version = "0.2.4"
 description = "Low-footprint real-time voice changer built on Edge0-AI Audio8-TTS-0.1B with portable .a8voice packs"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"

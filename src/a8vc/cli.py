@@ -146,6 +146,18 @@ def _build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--first-chunk-frames", type=int, default=None, help="Override first chunk frames")
     bench_p.add_argument("--chunk-frames", type=int, default=None, help="Override steady-state chunk frames")
     bench_p.add_argument("--context-frames", type=int, default=None, help="Override stream context frames")
+    bench_p.add_argument("--guard-frames", type=int, default=None, help="Override stream guard frames")
+    bench_p.add_argument(
+        "--kv-max-seq-len",
+        type=int,
+        default=None,
+        help="Override compacted Slow-AR KV-cache length (e.g. 512, or 0 for full 2048)",
+    )
+    bench_p.add_argument(
+        "--no-global-pool",
+        action="store_true",
+        help="Disable process-global ORT thread pool (use per-session partitioned pools)",
+    )
     bench_p.add_argument(
         "--no-pipeline",
         action="store_true",
@@ -414,6 +426,12 @@ def _cmd_benchmark(args: argparse.Namespace, cfg: AppConfig) -> int:
         rt_cfg.chunk_frames = args.chunk_frames
     if args.context_frames is not None:
         rt_cfg.stream_context_frames = args.context_frames
+    if args.guard_frames is not None:
+        rt_cfg.stream_guard_frames = args.guard_frames
+    if args.kv_max_seq_len is not None:
+        rt_cfg.slow_kv_max_seq_len = args.kv_max_seq_len
+    if args.no_global_pool:
+        rt_cfg.use_global_thread_pool = False
     if args.no_pipeline:
         rt_cfg.pipeline_decode = False
 
@@ -428,9 +446,11 @@ def _cmd_benchmark(args: argparse.Namespace, cfg: AppConfig) -> int:
             f"runs={args.runs} provider={rt.active_provider}"
         )
         print(
-            f"  Plan: ar_threads={rt.ar_threads} codec_threads={rt.codec_threads} "
-            f"pipeline={rt.cfg.pipeline_decode} first_chunk={rt.cfg.first_chunk_frames} "
-            f"chunk={rt.cfg.chunk_frames} ctx={rt.cfg.stream_context_frames} "
+            f"  Plan: global_pool={rt.global_pool_threads if rt.use_global_thread_pool else False} "
+            f"ar_threads={rt.ar_threads} codec_threads={rt.codec_threads} "
+            f"kv_seq={rt.active_max_seq_len} pipeline={rt.cfg.pipeline_decode} "
+            f"first_chunk={rt.cfg.first_chunk_frames} chunk={rt.cfg.chunk_frames} "
+            f"ctx={rt.cfg.stream_context_frames} guard={rt.cfg.stream_guard_frames} "
             f"iob=({rt._slow_iobs is not None}/{rt._fast_iob is not None})"
         )
     for i in range(1, max(1, args.runs) + 1):
@@ -483,12 +503,16 @@ def _cmd_benchmark(args: argparse.Namespace, cfg: AppConfig) -> int:
         "active_provider": rt.active_provider,
         "session_providers": rt.session_providers,
         "plan": {
+            "use_global_thread_pool": rt.use_global_thread_pool,
+            "global_pool_threads": rt.global_pool_threads,
             "ar_threads": rt.ar_threads,
             "codec_threads": rt.codec_threads,
+            "active_max_seq_len": rt.active_max_seq_len,
             "pipeline_decode": rt.cfg.pipeline_decode,
             "first_chunk_frames": rt.cfg.first_chunk_frames,
             "chunk_frames": rt.cfg.chunk_frames,
             "stream_context_frames": rt.cfg.stream_context_frames,
+            "stream_guard_frames": rt.cfg.stream_guard_frames,
             "iobinding_slow": rt._slow_iobs is not None,
             "iobinding_fast": rt._fast_iob is not None,
         },

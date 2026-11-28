@@ -598,35 +598,53 @@ def test_stream_audio_pipelined_matches_serial_and_guard_crossfade(
         language="en",
     )
 
+    monkeypatch.setattr(audio8_onnx, "is_global_thread_pool_enabled", lambda: False)
+
     rt_pipe = audio8_onnx.Audio8OnnxRuntime(
         tmp_path,
         RuntimeConfig(
-            first_chunk_frames=4,
+            first_chunk_frames=2,
             chunk_frames=6,
             stream_context_frames=4,
+            stream_guard_frames=0,
             pipeline_decode=True,
+            use_global_thread_pool=True,
         ),
     )
-    # Fast-AR must not spawn a busy-spinning thread pool that starves Slow-AR and Codec
+    # Default global thread pool mode shares one spinning pool across Slow-AR, Fast-AR, and Codec
+    assert create_calls["slow.onnx"]["use_global_pool"] is True
+    assert create_calls["fast.onnx"]["use_global_pool"] is True
+    assert create_calls["fast.onnx"]["allow_spinning"] is True
+    assert create_calls["dec.onnx"]["use_global_pool"] is True
+    assert create_calls["slow.onnx"]["allow_spinning"] is True
+    assert create_calls["dec.onnx"]["allow_spinning"] is True
+
+    # Per-session fallback mode: Fast-AR must not spawn a busy-spinning pool that starves Slow-AR/Codec
+    create_calls.clear()
+    rt_serial = audio8_onnx.Audio8OnnxRuntime(
+        tmp_path,
+        RuntimeConfig(
+            first_chunk_frames=2,
+            chunk_frames=6,
+            stream_context_frames=4,
+            stream_guard_frames=0,
+            pipeline_decode=False,
+            use_global_thread_pool=False,
+        ),
+    )
+    assert create_calls["fast.onnx"]["use_global_pool"] is False
     assert create_calls["fast.onnx"]["threads"] == 1
     assert create_calls["fast.onnx"]["allow_spinning"] is False
     assert create_calls["slow.onnx"]["allow_spinning"] is True
     assert create_calls["dec.onnx"]["allow_spinning"] is True
-    rt_serial = audio8_onnx.Audio8OnnxRuntime(
-        tmp_path,
-        RuntimeConfig(
-            first_chunk_frames=4,
-            chunk_frames=6,
-            stream_context_frames=4,
-            pipeline_decode=False,
-        ),
-    )
 
     pipe_chunks = list(rt_pipe.stream_audio("hello test", pack, seed=123))
     serial_chunks = list(rt_serial.stream_audio("hello test", pack, seed=123))
 
-    assert len(pipe_chunks) >= 2
-    assert pipe_chunks[0].frames_generated == 4  # progressive first_chunk_frames honored
+    assert len(pipe_chunks) >= 3
+    # Progressive doubling ramp: first_chunk=2 -> +4 (cumulative 6) -> +6 (cumulative 12) -> final
+    assert pipe_chunks[0].frames_generated == 2
+    assert pipe_chunks[1].frames_generated == 6
     assert pipe_chunks[-1].is_final is True
     pipe_wav = np.concatenate([c.audio for c in pipe_chunks])
     serial_wav = np.concatenate([c.audio for c in serial_chunks])
@@ -706,6 +724,483 @@ def test_tts_stream_closes_iterator_on_error_and_completion(tmp_path: Path) -> N
     r_err = client.post("/api/tts/stream", json={"voice_id": "close_test", "text": "boom"})
     assert r_err.status_code == 400
     assert closed_events == ["ok", "boom"]
+
+
+def test_slow_ar_kv_compaction_patches_caches_and_falls_back(tmp_path: Path) -> None:
+    from a8vc.runtime import slow_ar_kv
+
+    def _make_value_info(name: str, dims: list[int]) -> bytes:
+        shape_bytes = b"".join(
+            slow_ar_kv._encode_ld(1, slow_ar_kv._encode_varint_field(1, d)) for d in dims
+        )
+        tensor_type = slow_ar_kv._encode_varint_field(1, 1) + slow_ar_kv._encode_ld(2, shape_bytes)
+        type_proto = slow_ar_kv._encode_ld(1, tensor_type)
+        return slow_ar_kv._encode_ld(1, name.encode("utf-8")) + slow_ar_kv._encode_ld(2, type_proto)
+
+    def _make_const_node(name: str, arr: np.ndarray) -> bytes:
+        tensor_bytes = slow_ar_kv._encode_tensor_proto(arr, name=f"{name}_t")
+        attr_bytes = (
+            slow_ar_kv._encode_ld(1, b"value")
+            + slow_ar_kv._encode_ld(5, tensor_bytes)
+            + slow_ar_kv._encode_varint_field(20, 4)
+        )
+        return (
+            slow_ar_kv._encode_ld(3, name.encode("utf-8"))
+            + slow_ar_kv._encode_ld(4, b"Constant")
+            + slow_ar_kv._encode_ld(5, attr_bytes)
+        )
+
+    orig_len = 2048
+    graph_parts = [
+        slow_ar_kv._encode_ld(11, _make_value_info("cache_keys", [24, 1, 2, orig_len, 64])),
+        slow_ar_kv._encode_ld(11, _make_value_info("cache_values", [24, 1, 2, orig_len, 64])),
+        slow_ar_kv._encode_ld(11, _make_value_info("codes", [1, 11, 1])),
+        slow_ar_kv._encode_ld(13, _make_value_info("mask_inter", [1, 1, 1, orig_len])),
+        slow_ar_kv._encode_ld(1, _make_const_node("c_arange", np.arange(orig_len, dtype=np.int64))),
+        slow_ar_kv._encode_ld(1, _make_const_node("c_mask2d", np.zeros((1, orig_len), dtype=np.float32))),
+        slow_ar_kv._encode_ld(1, _make_const_node("c_mask4d", np.ones((1, 1, 1, orig_len), dtype=np.float32))),
+        slow_ar_kv._encode_ld(1, _make_const_node("c_len1", np.array([orig_len], dtype=np.int64))),
+        slow_ar_kv._encode_ld(1, _make_const_node("c_shape4", np.array([1, 1, 1, orig_len], dtype=np.int64))),
+        slow_ar_kv._encode_ld(1, _make_const_node("c_other", np.array([42], dtype=np.int64))),
+    ]
+    model_bytes = slow_ar_kv._encode_varint_field(1, 9) + slow_ar_kv._encode_ld(7, b"".join(graph_parts))
+
+    src = tmp_path / "slow_ar_int8.onnx"
+    src.write_bytes(model_bytes)
+
+    compact_path, eff_len = slow_ar_kv.prepare_compact_slow_ar_model(
+        src, target_seq_len=512, orig_seq_len=2048
+    )
+    assert eff_len == 512
+    assert compact_path.name == "slow_ar_int8.kv512.onnx"
+    assert compact_path.is_file()
+    meta_path = tmp_path / "slow_ar_int8.kv512.onnx.meta.json"
+    assert meta_path.is_file()
+
+    # Re-patching 512 -> 256 proves every expected input, value_info, and mask constant is now 512
+    _, stats_round2 = slow_ar_kv.patch_slow_ar_kv_bytes(
+        compact_path.read_bytes(), target_seq_len=256, orig_seq_len=512
+    )
+    assert set(stats_round2["inputs"]) == {"cache_keys", "cache_values"}
+    assert len(stats_round2["consts"]) == 5
+    assert stats_round2["value_infos"] == 1
+
+    # Second call hits cache without rewriting
+    mtime_before = compact_path.stat().st_mtime_ns
+    compact_path_2, eff_len_2 = slow_ar_kv.prepare_compact_slow_ar_model(
+        src, target_seq_len=512, orig_seq_len=2048
+    )
+    assert compact_path_2 == compact_path
+    assert eff_len_2 == 512
+    assert compact_path_2.stat().st_mtime_ns == mtime_before
+
+    # Disabled or non-matching graph falls back cleanly
+    same_path, full_len = slow_ar_kv.prepare_compact_slow_ar_model(
+        src, target_seq_len=0, orig_seq_len=2048
+    )
+    assert same_path == src and full_len == 2048
+
+    stub = tmp_path / "stub.onnx"
+    stub.write_bytes(b"not-a-model")
+    fb_path, fb_len = slow_ar_kv.prepare_compact_slow_ar_model(
+        stub, target_seq_len=512, orig_seq_len=2048
+    )
+    assert fb_path == stub and fb_len == 2048
+
+
+def test_global_thread_pool_sizing_and_session_options(monkeypatch: Any) -> None:
+    import types
+
+    from a8vc.runtime import providers
+
+    # Pipelined CPU sizing leaves room for 2 active caller threads alongside G-1 workers
+    assert providers.compute_global_pool_threads(threads=8, pipeline_decode=True) == (6, 8)
+    assert providers.compute_global_pool_threads(threads=4, pipeline_decode=True) == (3, 4)
+    assert providers.compute_global_pool_threads(threads=2, pipeline_decode=True) == (2, 2)
+    # GPU codec / serial mode uses full pool up to cap
+    assert providers.compute_global_pool_threads(threads=0, codec_on_gpu=True, cpu_count=16) == (6, 8)
+    assert providers.compute_global_pool_threads(threads=8, codec_on_gpu=True) == (8, 8)
+    assert providers.compute_global_pool_threads(threads=6, pipeline_decode=False) == (6, 6)
+
+    pool_calls: list[tuple[int, int]] = []
+    created_opts: list[Any] = []
+
+    class _FakeOpts:
+        def __init__(self) -> None:
+            self.graph_optimization_level = None
+            self.intra_op_num_threads = 0
+            self.inter_op_num_threads = 0
+            self.use_per_session_threads = True
+            self.configs: dict[str, str] = {}
+
+        def add_session_config_entry(self, key: str, value: str) -> None:
+            self.configs[key] = value
+
+    class _FakeSession:
+        def __init__(self, _path: str, sess_options: Any, providers: list[str]) -> None:
+            created_opts.append(sess_options)
+            self._providers = providers
+
+        def get_providers(self) -> list[str]:
+            return self._providers
+
+    fake_ort = types.SimpleNamespace(
+        GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
+        ExecutionMode=types.SimpleNamespace(ORT_SEQUENTIAL=0),
+        SessionOptions=_FakeOpts,
+        InferenceSession=_FakeSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+        set_global_thread_pool_sizes=lambda intra, inter: pool_calls.append((intra, inter)),
+    )
+
+    _, active_ep, warn = providers.create_onnx_session(
+        "dummy.onnx",
+        provider="cpu",
+        threads=6,
+        inter_op_threads=1,
+        allow_spinning=True,
+        use_global_pool=True,
+        global_pool_threads=6,
+        ort_module=fake_ort,
+    )
+    assert active_ep == "CPUExecutionProvider"
+    assert warn is None
+    assert pool_calls == [(6, 1)]
+    assert created_opts[0].use_per_session_threads is False
+    assert created_opts[0].intra_op_num_threads == 0
+    assert created_opts[0].configs["session.intra_op.allow_spinning"] == "1"
+
+    # Secondary sessions (e.g. codec_encoder during voice enrollment) that omit use_global_pool
+    # must inherit use_per_session_threads=False once the process-global pool is active.
+    monkeypatch.setattr(providers, "_GLOBAL_POOL_THREADS", 6)
+    fake_real_ort = types.SimpleNamespace(
+        __name__="onnxruntime",
+        GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99),
+        ExecutionMode=types.SimpleNamespace(ORT_SEQUENTIAL=0),
+        SessionOptions=_FakeOpts,
+        InferenceSession=_FakeSession,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+    )
+    providers.create_onnx_session("encoder.onnx", provider="cpu", ort_module=fake_real_ort)
+    assert created_opts[-1].use_per_session_threads is False
+    assert created_opts[-1].intra_op_num_threads == 0
+
+    # Already-created global pool error is handled idempotently
+    def _already_created(_intra: int, _inter: int) -> None:
+        raise RuntimeError("Global thread pools have already been created, cannot replace them")
+
+    fake_ort_existing = types.SimpleNamespace(set_global_thread_pool_sizes=_already_created)
+    assert providers.ensure_global_thread_pool(6, 1, ort_module=fake_ort_existing) == 6
+
+
+def test_slow_ar_auto_expands_to_full_context_on_long_voice(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import types
+
+    from a8vc.config import RuntimeConfig
+    from a8vc.runtime import audio8_onnx
+
+    manifest = {
+        "model_id": "test-expand",
+        "model_fingerprint": "test-expand-v1",
+        "slow_decode_model": "slow.onnx",
+        "fast_model": "fast.onnx",
+        "codec_models": "dec.onnx",
+        "sample_rate": 44100,
+        "codec_hop_length": 512,
+        "num_codebooks": 10,
+        "codebook_size": 32,
+        "semantic_begin_id": 1000,
+        "semantic_end_id": 1031,
+        "im_end_id": 32,
+        "max_seq_len": 256,
+        "num_layers": 2,
+        "n_local_heads": 2,
+        "head_dim": 8,
+        "num_fast_layers": 1,
+        "fast_n_local_heads": 2,
+        "fast_head_dim": 8,
+        "mamba_d_conv": 2,
+        "mamba_d_ssm": 8,
+        "mamba_d_state": 4,
+        "mamba_d_head": 4,
+        "mamba_n_heads": 2,
+        "mamba_n_groups": 1,
+    }
+    (tmp_path / "runtime_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for fname in ("slow.onnx", "slow.kv128.onnx", "fast.onnx", "dec.onnx", "tokenizer.json"):
+        (tmp_path / fname).write_bytes(b"stub")
+
+    class _IO:
+        def __init__(self, name: str, shape: list[int], typ: str) -> None:
+            self.name = name
+            self.shape = shape
+            self.type = typ
+
+    class _FakeSlow:
+        def __init__(self, seq_len: int) -> None:
+            self.seq_len = seq_len
+
+        def get_inputs(self) -> list[_IO]:
+            return [
+                _IO("codes", [1, 11, 1], "tensor(int64)"),
+                _IO("position", [1], "tensor(int64)"),
+                _IO("cache_keys", [2, 1, 2, self.seq_len, 8], "tensor(float)"),
+                _IO("cache_values", [2, 1, 2, self.seq_len, 8], "tensor(float)"),
+                _IO("conv_states", [2, 1, 16, 2], "tensor(float)"),
+                _IO("ssm_states", [2, 1, 2, 4, 4], "tensor(float)"),
+            ]
+
+        def get_outputs(self) -> list[_IO]:
+            return [
+                _IO("logits", [1, 1, 33], "tensor(float)"),
+                _IO("hidden", [1, 1, 16], "tensor(float)"),
+                _IO("key_delta", [2, 1, 2, 8], "tensor(float)"),
+                _IO("value_delta", [2, 1, 2, 8], "tensor(float)"),
+                _IO("next_conv_states", [2, 1, 16, 2], "tensor(float)"),
+                _IO("next_ssm_states", [2, 1, 2, 4, 4], "tensor(float)"),
+            ]
+
+        def run(self, _outs: Any, feed: dict[str, np.ndarray]) -> list[np.ndarray]:
+            assert feed["cache_keys"].shape[3] == self.seq_len
+            logits = np.full((1, 1, 33), -20.0, dtype=np.float32)
+            logits[0, 0, 32] = 10.0
+            return [
+                logits,
+                np.zeros((1, 1, 16), dtype=np.float32),
+                np.zeros((2, 1, 2, 8), dtype=np.float32),
+                np.zeros((2, 1, 2, 8), dtype=np.float32),
+                feed["conv_states"].copy(),
+                feed["ssm_states"].copy(),
+            ]
+
+    class _FakeFast:
+        def get_inputs(self) -> list[_IO]:
+            return [
+                _IO("slow_hidden", [1, 1, 16], "tensor(float)"),
+                _IO("token_id", [1, 1], "tensor(int64)"),
+                _IO("use_slow_hidden", [1], "tensor(bool)"),
+                _IO("input_pos", [1], "tensor(int64)"),
+                _IO("cache_key_0", [1, 2, 10, 8], "tensor(float)"),
+                _IO("cache_value_0", [1, 2, 10, 8], "tensor(float)"),
+            ]
+
+        def get_outputs(self) -> list[_IO]:
+            return [
+                _IO("logits", [1, 1, 32], "tensor(float)"),
+                _IO("key_delta_0", [1, 2, 1, 8], "tensor(float)"),
+                _IO("value_delta_0", [1, 2, 1, 8], "tensor(float)"),
+            ]
+
+    class _FakeDecoder:
+        def get_inputs(self) -> list[_IO]:
+            return [_IO("codes", [1, 10, 1], "tensor(int64)")]
+
+    class _FakeTokenizer:
+        @staticmethod
+        def from_file(_path: str) -> Any:
+            class _Tok:
+                def encode(self, seq: str, add_special_tokens: bool = False) -> Any:
+                    return types.SimpleNamespace(ids=[1 + (i % 50) for i in range(max(1, len(seq) // 6))])
+
+            return _Tok()
+
+    loaded_slow_paths: list[str] = []
+
+    def _fake_create_sess(path: Path, **_kwargs: Any) -> tuple[Any, str, None]:
+        if path.name == "slow.kv128.onnx":
+            loaded_slow_paths.append(path.name)
+            return _FakeSlow(128), "CPUExecutionProvider", None
+        if path.name == "slow.onnx":
+            loaded_slow_paths.append(path.name)
+            return _FakeSlow(256), "CPUExecutionProvider", None
+        if path.name == "fast.onnx":
+            return _FakeFast(), "CPUExecutionProvider", None
+        return _FakeDecoder(), "CPUExecutionProvider", None
+
+    monkeypatch.setattr(audio8_onnx, "is_global_thread_pool_enabled", lambda: False)
+    monkeypatch.setattr(
+        audio8_onnx,
+        "prepare_compact_slow_ar_model",
+        lambda _p, **_kw: (tmp_path / "slow.kv128.onnx", 128),
+    )
+    monkeypatch.setattr(audio8_onnx, "create_onnx_session", _fake_create_sess)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "tokenizers",
+        types.SimpleNamespace(Tokenizer=_FakeTokenizer),
+    )
+
+    rt = audio8_onnx.Audio8OnnxRuntime(tmp_path, RuntimeConfig(slow_kv_max_seq_len=128))
+    assert rt.active_max_seq_len == 128
+    assert loaded_slow_paths == ["slow.kv128.onnx"]
+
+    # Short voice stays in compact 128-slot KV cache
+    short_pack = build_voice_pack(
+        voice_id="short",
+        codes=np.zeros((10, 6), dtype=np.int64),
+        reference_text="hi",
+        name="Short",
+        language="en",
+    )
+    rt.warm_voice(short_pack)
+    assert rt.active_max_seq_len == 128
+
+    # Long voice exceeds 128 - 96 headroom -> auto-expands seamlessly to full 256-slot KV cache
+    long_pack = build_voice_pack(
+        voice_id="long",
+        codes=np.zeros((10, 60), dtype=np.int64),
+        reference_text="a moderately long reference voice prompt",
+        name="Long",
+        language="en",
+    )
+    rt.warm_voice(long_pack)
+    assert rt.active_max_seq_len == 256
+    assert rt._workspace["cache_keys"].shape[3] == 256
+    assert loaded_slow_paths == ["slow.kv128.onnx", "slow.onnx"]
+    rt.close()
+
+
+def test_speculative_asr_hits_when_idle_and_misses_when_speech_resumes() -> None:
+    import threading
+    import time
+
+    from a8vc.audio.vad import SpeechSegmenter
+    from a8vc.engine.cascaded import CascadedVCEngine, RealtimeVCWorker
+    from a8vc.runtime.audio8_onnx import StreamAudioChunk
+
+    class _ScriptedVAD:
+        frame_samples = 512
+
+        def __init__(self) -> None:
+            self.probs: list[float] = []
+
+        def probability(self, _frame: np.ndarray) -> float:
+            return self.probs.pop(0) if self.probs else 0.0
+
+        def reset(self) -> None:
+            return None
+
+    class _CountingASR:
+        name = "counting-asr"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
+            self.calls += 1
+            return f"len={audio.size}"
+
+        def close(self) -> None:
+            return None
+
+    class _FakeSynth:
+        sample_rate = 44100
+
+        def warm_voice(self, _voice: Any) -> float:
+            return 1.0
+
+        def stream_audio(self, _text: str, _voice: Any, **_kwargs: Any) -> Any:
+            yield StreamAudioChunk(
+                audio=np.full(512, 0.05, dtype=np.float32),
+                sample_rate=44100,
+                frames_generated=2,
+                ttfa_ms=5.0,
+                prefill_ms=1.0,
+                cache_hit=True,
+                is_final=True,
+            )
+
+        def cache_stats(self) -> dict[str, Any]:
+            return {}
+
+        def close(self) -> None:
+            return None
+
+    vad = _ScriptedVAD()
+    seg = SpeechSegmenter(
+        vad,
+        sample_rate=16000,
+        speech_start_ms=32,   # 1 frame
+        min_silence_ms=192,   # 6 frames
+        pre_speech_ms=0,
+        min_segment_ms=96,    # 3 frames
+        max_segment_ms=5000,
+    )
+
+    # First verify segmenter speculative peek matches finalized waveform bit-for-bit
+    frame = np.full(512, 0.25, dtype=np.float32)
+    vad.probs = [0.9, 0.9, 0.9, 0.9, 0.1, 0.1]
+    assert seg.feed(np.tile(frame, 6)) == []
+    cand = seg.peek_speculative_segment()
+    assert cand is not None and cand.spec_key is not None
+    # Deduplicated until audio progresses
+    assert seg.peek_speculative_segment() is None
+
+    vad.probs = [0.1, 0.1, 0.1, 0.1]
+    finalized = seg.feed(np.tile(frame, 4))
+    assert len(finalized) == 1
+    assert finalized[0].spec_key == cand.spec_key
+    assert np.array_equal(finalized[0].audio, cand.audio)
+
+    # Now test RealtimeVCWorker hit on idle and safe miss when speech resumes
+    seg.reset()
+    asr = _CountingASR()
+    engine = CascadedVCEngine(synthesizer=_FakeSynth(), asr=asr, segmenter=seg)
+    pack = build_voice_pack(
+        voice_id="spec_voice",
+        codes=np.zeros((10, 4), dtype=np.int64),
+        reference_text="hi",
+        name="Spec",
+        language="en",
+    )
+    engine.set_voice(pack, warm=False)
+
+    events: list[Any] = []
+    got_event = threading.Event()
+
+    def _on_evt(evt: Any) -> None:
+        events.append(evt)
+        got_event.set()
+
+    worker = RealtimeVCWorker(engine, _on_evt)
+    worker.start()
+    try:
+        # Utterance 1: 4 speech + 2 silence -> triggers idle speculative ASR; wait briefly -> 4 silence finalizes
+        vad.probs = [0.9, 0.9, 0.9, 0.9, 0.1, 0.1]
+        worker.submit_audio(np.tile(frame, 6), 16000)
+        deadline = time.monotonic() + 2.0
+        while asr.calls < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert asr.calls == 1
+
+        vad.probs = [0.1, 0.1, 0.1, 0.1]
+        worker.submit_audio(np.tile(frame, 4), 16000)
+        assert got_event.wait(timeout=2.0)
+        assert worker.speculative_asr_hits == 1
+        assert asr.calls == 1  # Speculative transcript reused with zero duplicate ASR
+        assert events[-1].transcript == f"len={6 * 512}"
+
+        # Utterance 2: 4 speech + 2 silence (speculatively transcribed) -> speech resumes (+2 speech) -> 6 silence
+        got_event.clear()
+        vad.probs = [0.9, 0.9, 0.9, 0.9, 0.1, 0.1]
+        worker.submit_audio(np.tile(frame, 6), 16000)
+        deadline = time.monotonic() + 2.0
+        while asr.calls < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert asr.calls == 2
+
+        # Speech resumes -> spec_key changes -> finalized utterance must re-run ASR on complete audio
+        vad.probs = [0.9, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        worker.submit_audio(np.tile(frame, 8), 16000)
+        assert got_event.wait(timeout=2.0)
+        assert worker.speculative_asr_hits == 1  # Still 1; stale speculation was NOT reused
+        assert asr.calls == 3
+        assert events[-1].transcript == f"len={10 * 512}"
+    finally:
+        worker.stop()
+
 
 
 

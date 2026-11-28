@@ -255,6 +255,7 @@ def check_windows_e2e_harness(ctx: LintContext) -> list[LintFinding]:
             ("/api/tts/stream", "streaming TTS API verification"),
             ("/icon.svg", "brand icon HTTP verification"),
             ("cp1252", "legacy Windows CP1252 console codepage verification"),
+            ("reconfigure(", "UTF-8/replace stdio reconfiguration preventing CP1252 print crashes on CJK ASR output"),
         ):
             if token not in py_text:
                 findings.append(

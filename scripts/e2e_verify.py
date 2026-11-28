@@ -34,6 +34,18 @@ import httpx
 import numpy as np
 from websockets.sync.client import connect as ws_connect
 
+# Avoid UnicodeEncodeError on legacy Windows console/pipe codepages (e.g. cp1252)
+# when printing CJK ASR transcripts or error diagnostics.
+for _stdio_stream in (sys.stdout, sys.stderr):
+    if _stdio_stream is not None and hasattr(_stdio_stream, "reconfigure"):
+        try:
+            _stdio_stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                _stdio_stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
